@@ -60,14 +60,14 @@ static struct {
     // Double-buffered async output
     CVPixelBufferRef interp_output[2];
     IOSurfaceRef interp_iosurface[2];
-    atomic_int ready_idx;      // index of buffer ready for display (-1 = none)
-    atomic_int ready_fc;       // frame_count when ready result was computed
-    atomic_bool processing;    // true while async VT is running
-    atomic_bool pending;       // true if new frames arrived during processing
+    // Packed publication: (result_fc << 1) | buffer_idx, or -1 for none.
+    // A single atomic so the consumer can never pair a new index with a
+    // stale frame count (or vice versa).
+    atomic_int ready_state;
     dispatch_queue_t queue;    // serial queue for async processing
 } g_interp;
 
-static void do_vt_processing(void);
+static void do_vt_processing(int head, int fc);
 
 static CVPixelBufferRef create_iosurface_pixel_buffer(int width, int height)
 {
@@ -108,10 +108,7 @@ bool frame_interp_init(int width, int height)
     }
 
     memset(&g_interp, 0, sizeof(g_interp));
-    atomic_store(&g_interp.ready_idx, -1);
-    atomic_store(&g_interp.ready_fc, 0);
-    atomic_store(&g_interp.processing, false);
-    atomic_store(&g_interp.pending, false);
+    atomic_store(&g_interp.ready_state, -1);
 
     if (!frame_interp_is_available()) {
         fprintf(stderr, "[frame-interp] VTFrameRateConversion not available\n");
@@ -234,28 +231,25 @@ void frame_interp_finalize(void)
         g_interp.queue = nil;
     }
 
-    atomic_store(&g_interp.ready_idx, -1);
-    atomic_store(&g_interp.ready_fc, 0);
-    atomic_store(&g_interp.processing, false);
-    atomic_store(&g_interp.pending, false);
+    atomic_store(&g_interp.ready_state, -1);
     g_interp.initialized = false;
     g_interp.available = false;
 }
 
-// Run VT processing on the current ring buffer contents.
-// Must be called from the dispatch queue.
-static void do_vt_processing(void)
+// Interpolate the midpoint of the frame pair identified by the (head, fc)
+// snapshot captured at push time. Must be called from the dispatch queue;
+// the snapshot guarantees we only pair ring slots whose copies have
+// completed (the serial queue orders copies ahead of this call).
+static void do_vt_processing(int head, int fc)
 {
     @autoreleasepool {
     if (@available(macOS 15.4, *)) {
-        int head = atomic_load(&g_interp.ring_head);
         int prev_idx = (head + RING_SIZE - 1) % RING_SIZE;
         int curr_idx = head;
-        int fc = atomic_load(&g_interp.frame_count);
 
         // Write to the buffer NOT currently being displayed
-        int ready = atomic_load(&g_interp.ready_idx);
-        int write_idx = (ready == 0) ? 1 : 0;
+        int ready = atomic_load(&g_interp.ready_state);
+        int write_idx = (ready >= 0 && (ready & 1) == 0) ? 1 : 0;
 
         CMTime prev_time = CMTimeMake(fc - 1, 30);
         CMTime curr_time = CMTimeMake(fc, 30);
@@ -303,8 +297,7 @@ static void do_vt_processing(void)
                                              error:&error];
         if (ok) {
             // Atomically publish the new result with its frame count
-            atomic_store(&g_interp.ready_fc, fc);
-            atomic_store(&g_interp.ready_idx, write_idx);
+            atomic_store(&g_interp.ready_state, (fc << 1) | write_idx);
         }
     }
     } // @autoreleasepool
@@ -367,14 +360,10 @@ void frame_interp_push_frame(IOSurfaceRef surface)
     // Retain IOSurface for the async block
     CFRetain(surface);
 
-    // If VT is currently processing, mark pending so it re-dispatches
-    // when done with the latest frames
-    if (atomic_load(&g_interp.processing)) {
-        atomic_store(&g_interp.pending, true);
-    }
-
     // Dispatch all heavy work (copy + VT) to background queue.
-    // Capture head and fc by value so the async block uses a snapshot.
+    // Capture head and fc by value so the async block uses a snapshot —
+    // the queue may run this block after further pushes have advanced
+    // the live counters.
     dispatch_async(g_interp.queue, ^{
         if (!g_interp.initialized) {
             CFRelease(surface);
@@ -385,46 +374,47 @@ void frame_interp_push_frame(IOSurfaceRef surface)
         do_push_copy(surface, head);
         CFRelease(surface);
 
-        // Only start VT if we have 2+ frames and nothing is already running
         if (fc < 2) {
             return;
         }
 
-        // Mark as processing (if not already)
-        bool expected = false;
-        if (!atomic_compare_exchange_strong(&g_interp.processing,
-                                            &expected, true)) {
-            // Another VT job is still running — pending flag is already set
+        // Coalesce: if a newer frame has already been pushed, skip this
+        // pair — the newer push's block will interpolate the newer pair.
+        if (atomic_load(&g_interp.frame_count) != fc) {
             return;
         }
 
-        do_vt_processing();
-
-        // Check if new frames arrived while we were processing
-        while (atomic_exchange(&g_interp.pending, false)) {
-            do_vt_processing();
-        }
-
-        atomic_store(&g_interp.processing, false);
+        do_vt_processing(head, fc);
     });
 }
 
-IOSurfaceRef frame_interp_get_interpolated(void)
+int frame_interp_frame_count(void)
+{
+    if (!g_interp.initialized) {
+        return 0;
+    }
+    return atomic_load(&g_interp.frame_count);
+}
+
+IOSurfaceRef frame_interp_get_interpolated(int *out_fc)
 {
     if (!g_interp.initialized || atomic_load(&g_interp.frame_count) < 2) {
         return NULL;
     }
 
-    // Non-blocking: return the most recently completed result.
-    // Skip if the result is too stale (>2 game frames behind).
-    int idx = atomic_load(&g_interp.ready_idx);
-    if (idx >= 0 && idx < 2) {
-        int result_fc = atomic_load(&g_interp.ready_fc);
-        int current_fc = atomic_load(&g_interp.frame_count);
-        if (current_fc - result_fc <= 2) {
-            return g_interp.interp_iosurface[idx];
-        }
+    // Non-blocking. Only return the midpoint of the newest pushed pair:
+    // any older midpoint lies temporally behind a frame the caller has
+    // already displayed and would step motion backwards.
+    int state = atomic_load(&g_interp.ready_state);
+    if (state < 0) {
+        return NULL;
     }
-
-    return NULL;
+    int result_fc = state >> 1;
+    if (result_fc != atomic_load(&g_interp.frame_count)) {
+        return NULL;
+    }
+    if (out_fc) {
+        *out_fc = result_fc;
+    }
+    return g_interp.interp_iosurface[state & 1];
 }
