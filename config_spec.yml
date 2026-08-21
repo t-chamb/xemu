@@ -241,6 +241,13 @@ display:
     type: enum
     values: [linear, nearest]
     default: linear
+  texture_pipeline:
+    dump:
+      type: bool
+      default: false
+    replace:
+      type: bool
+      default: true
   window:
     fullscreen_on_startup: bool
     fullscreen_exclusive: bool

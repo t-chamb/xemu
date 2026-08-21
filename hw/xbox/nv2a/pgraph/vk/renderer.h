@@ -229,6 +229,9 @@ typedef struct TextureBinding {
     uint64_t hash;
     unsigned int draw_time;
     uint32_t submit_time;
+    /* Non-NULL when the image holds replacement data (texrep.h); owned by
+     * the texrep session cache, not this binding. */
+    const struct TexRepImage *replacement;
 } TextureBinding;
 
 typedef struct QueryReport {

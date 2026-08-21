@@ -17,6 +17,7 @@ specific_ss.add([volk, libglslang, vma, vulkan, spirv_reflect,
 		'shaders.c',
 		'surface-compute.c',
 		'surface.c',
+		'texrep.c',
 		'texture.c',
 		'vertex.c',
 		)
