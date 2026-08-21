@@ -22,6 +22,10 @@
 #include "renderer.h"
 #include "xemu-version.h"
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #define VkExtensionPropertiesArray GArray
 #define StringArray GArray
 
@@ -35,6 +39,8 @@ static char const *const required_device_extensions[] = {
 #ifdef WIN32
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+#elif defined(__APPLE__)
+    "VK_KHR_portability_subset",
 #else
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
@@ -142,6 +148,11 @@ add_optional_instance_extension_names(PGRAPHState *pg,
         g_config.display.vulkan.validation_layers &&
         add_extension_if_available(available_extensions, enabled_extension_names,
                                    VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+#ifdef __APPLE__
+    add_extension_if_available(available_extensions, enabled_extension_names,
+                               VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
 }
 
 #if defined(VK_API_VERSION_1_4)
@@ -156,6 +167,45 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
     VkResult result;
+
+#if defined(__APPLE__)
+    // Set VK_ICD_FILENAMES so the Vulkan loader finds the bundled MoltenVK ICD
+    // when launched from Finder (where env vars from terminal are not inherited).
+    // The 0 flag means don't overwrite if already set (e.g. from terminal).
+    {
+        char exe_path[PATH_MAX];
+        uint32_t exe_path_size = sizeof(exe_path);
+        if (_NSGetExecutablePath(exe_path, &exe_path_size) == 0) {
+            char real_path[PATH_MAX];
+            if (realpath(exe_path, real_path)) {
+                char *dir = g_path_get_dirname(real_path);
+                char *icd_path = g_build_filename(
+                    dir, "..", "Resources", "vulkan", "icd.d",
+                    "MoltenVK_icd.json", NULL);
+                char *icd_real = realpath(icd_path, NULL);
+                if (icd_real) {
+                    setenv("VK_ICD_FILENAMES", icd_real, 0);
+                    setenv("VK_DRIVER_FILES", icd_real, 0);
+                    free(icd_real);
+                }
+                g_free(icd_path);
+                g_free(dir);
+            }
+        }
+    }
+
+    // Tune MoltenVK for emulator workload via environment variables.
+    // These are only applied if not already set by the user.
+    setenv("MVK_CONFIG_FAST_MATH_ENABLED", "1", 0);
+    setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+    setenv("MVK_CONFIG_SHADER_COMPRESSION_ALGORITHM", "3", 0); // LZ4
+    setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "1", 0);
+    setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+    setenv("MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE", "128", 0);
+    setenv("MVK_CONFIG_VK_SEMAPHORE_SUPPORT_STYLE", "2", 0);
+    setenv("MVK_CONFIG_USE_MTLHEAP", "2", 0);
+    setenv("MVK_CONFIG_METAL_COMPILE_TIMEOUT", "5000000000", 0);
+#endif
 
     result = volkInitialize();
     if (result != VK_SUCCESS) {
@@ -207,6 +257,9 @@ static bool create_instance(PGRAPHState *pg, Error **errp)
         .enabledExtensionCount = enabled_extension_names->len,
         .ppEnabledExtensionNames =
             &g_array_index(enabled_extension_names, const char *, 0),
+#ifdef __APPLE__
+        .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
+#endif
     };
 
     enable_validation = g_config.display.vulkan.validation_layers;
@@ -557,11 +610,19 @@ static bool create_logical_device(PGRAPHState *pg, Error **errp)
         }
         F(depthClamp, true),
         F(fillModeNonSolid, true),
+#if defined(__APPLE__)
+        F(geometryShader, false),
+#else
         F(geometryShader, true),
+#endif
         F(occlusionQueryPrecise, true),
         F(samplerAnisotropy, false),
         F(shaderClipDistance, true),
+#if defined(__APPLE__)
+        F(shaderTessellationAndGeometryPointSize, false),
+#else
         F(shaderTessellationAndGeometryPointSize, true),
+#endif
         F(wideLines, false),
         #undef F
         // clang-format on
