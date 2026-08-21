@@ -419,7 +419,10 @@ for name in entries {
         continue
     }
     let w = image.width, h = image.height
-    if w * SCALE > maxDim || h * SCALE > maxDim {
+    /* The scaler only does 4x and image inputs cap at 1920; anything whose
+     * 4x result exceeds maxDim gets downsampled after upscaling — a 1024
+     * source still comes out 2x sharper at the 2048 cap. */
+    if w > 1920 || h > 1920 {
         skippedBig += 1
         continue
     }
@@ -448,13 +451,43 @@ for name in entries {
     }
 
     let alpha = upscaledAlpha(image, width: w * SCALE, height: h * SCALE)
-    let rgba = assembleStraightRGBA(from: dst, alpha: alpha)
+    var rgba = assembleStraightRGBA(from: dst, alpha: alpha)
+    var outW = w * SCALE, outH = h * SCALE
+
+    if outW > maxDim || outH > maxDim {
+        let s = Double(maxDim) / Double(max(outW, outH))
+        let tw = max(Int(Double(outW) * s) & ~1, 2)
+        let th = max(Int(Double(outH) * s) & ~1, 2)
+        guard let big = straightRGBAImage(rgba, width: outW, height: outH) else {
+            FileHandle.standardError.write("FAIL \(name): downsample stage\n".data(using: .utf8)!)
+            failed += 1
+            continue
+        }
+        /* Same premultiply-safe split as everywhere else: RGB through the
+         * opaque reinterpretation, alpha through its own channel. */
+        var down = [UInt8](repeating: 0, count: tw * th * 4)
+        down.withUnsafeMutableBytes { buf in
+            let ctx = CGContext(
+                data: buf.baseAddress, width: tw, height: th,
+                bitsPerComponent: 8, bytesPerRow: tw * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            ctx.interpolationQuality = .high
+            ctx.draw(opaqueView(of: big), in: CGRect(x: 0, y: 0, width: tw, height: th))
+        }
+        let downAlpha = upscaledAlpha(big, width: tw, height: th)
+        for i in 0..<(tw * th) { down[i * 4 + 3] = downAlpha[i] }
+        rgba = down
+        outW = tw
+        outH = th
+    }
+
     guard verify(source: image, output: rgba,
-                 outCount: w * SCALE * h * SCALE, name: name) else {
+                 outCount: outW * outH, name: name) else {
         verifyFailed += 1
         continue
     }
-    guard let out = straightRGBAImage(rgba, width: w * SCALE, height: h * SCALE),
+    guard let out = straightRGBAImage(rgba, width: outW, height: outH),
           writePNG(out, to: outPath) else {
         FileHandle.standardError.write("FAIL \(name): output write\n".data(using: .utf8)!)
         failed += 1
