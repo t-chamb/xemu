@@ -145,11 +145,13 @@ func cgImage(from pb: CVPixelBuffer) -> CGImage? {
 /* Bicubic-upscale the source's alpha channel to target size, returning a
  * byte per pixel. */
 func upscaledAlpha(_ image: CGImage, width: Int, height: Int) -> [UInt8] {
-    var alpha = [UInt8](repeating: 255, count: width * height)
     guard image.alphaInfo != .none && image.alphaInfo != .noneSkipFirst &&
           image.alphaInfo != .noneSkipLast else {
-        return alpha
+        return [UInt8](repeating: 255, count: width * height)
     }
+    /* Must start at zero: drawing composites source-over, and an opaque
+     * destination would absorb every source alpha into 255. */
+    var alpha = [UInt8](repeating: 0, count: width * height)
     alpha.withUnsafeMutableBytes { buf in
         let ctx = CGContext(
             data: buf.baseAddress, width: width, height: height,
