@@ -260,6 +260,10 @@ display:
     frame_interpolation:
       type: bool
       default: true
+    frame_interpolation_quality:
+      type: enum
+      values: [auto, low, medium, high, ultra]
+      default: auto
   ui:
     show_menubar:
       type: bool

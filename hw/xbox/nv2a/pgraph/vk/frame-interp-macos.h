@@ -37,6 +37,14 @@ bool frame_interp_init(int width, int height);
 /* Tear down frame interpolation resources */
 void frame_interp_finalize(void);
 
+/* Report the current display drawable size; caps interpolation resolution
+ * (midpoints are never presented above it). Safe to call every frame. */
+void frame_interp_set_display_size(int width, int height);
+
+/* Pin interpolation resolution to the largest ladder rung <= max_dim and
+ * disable adaptation; 0 restores adaptive behavior. */
+void frame_interp_set_quality_cap(int max_dim);
+
 /* Push a new real frame's IOSurface into the ring buffer */
 void frame_interp_push_frame(IOSurfaceRef surface);
 

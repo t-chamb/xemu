@@ -792,8 +792,20 @@ void MainMenuDisplayView::Draw()
     Toggle("Vertical refresh sync", &g_config.display.window.vsync,
            "Sync to screen vertical refresh to reduce tearing artifacts");
 #if defined(__APPLE__)
-    Toggle("Frame interpolation", &g_config.display.window.frame_interpolation,
-           "Generate intermediate frames for smoother gameplay (macOS 15.4+)");
+    Toggle("Frame interpolation (Neural Engine)",
+           &g_config.display.window.frame_interpolation,
+           "Generate in-between frames on the Neural Engine (macOS 15.4+)");
+    if (g_config.display.window.frame_interpolation) {
+        ChevronCombo(
+            "Interpolation quality",
+            &g_config.display.window.frame_interpolation_quality,
+            "Auto\0"
+            "Low (640)\0"
+            "Medium (1280)\0"
+            "High (1920)\0"
+            "Ultra (2560)\0",
+            "Generated frame resolution; Auto adapts to display and speed");
+    }
 #endif
 
     SectionTitle("Interface");
