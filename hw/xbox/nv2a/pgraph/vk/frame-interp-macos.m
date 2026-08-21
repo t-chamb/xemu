@@ -34,8 +34,10 @@
 
 #include "frame-interp-macos.h"
 
-// Ring buffer of 2 frames (prev + current)
-#define RING_SIZE 2
+// Ring of recent real frames. Three slots so the synchronous push-time
+// copy never writes a slot the (at most one frame behind, coalesced)
+// async VT job may still be reading.
+#define RING_SIZE 3
 
 // Cap interpolation resolution for performance. VTFrameProcessor has ~15ms
 // of fixed neural engine overhead regardless of resolution.
@@ -103,6 +105,9 @@ bool frame_interp_is_available(void)
 
 bool frame_interp_init(int width, int height)
 {
+    // MRC: pool for the autoreleased literals created below; the render
+    // thread calling this has no pool of its own.
+    @autoreleasepool {
     if (g_interp.initialized) {
         frame_interp_finalize();
     }
@@ -155,7 +160,9 @@ bool frame_interp_init(int width, int height)
         if (!ok) {
             fprintf(stderr, "[frame-interp] Failed to start session: %s\n",
                     error.localizedDescription.UTF8String);
+            [processor release];
             g_interp.processor = nil;
+            [config release];
             g_interp.config = nil;
             return false;
         }
@@ -191,10 +198,16 @@ bool frame_interp_init(int width, int height)
         atomic_store(&g_interp.frame_count, 0);
         atomic_store(&g_interp.ring_head, 0);
 
+        fprintf(stderr,
+                "[frame-interp] session started: %dx%d source, %dx%d "
+                "interpolation%s\n",
+                width, height, interp_w, interp_h,
+                g_interp.needs_scale ? " (downscaled)" : "");
         return true;
     }
 
     return false;
+    } // @autoreleasepool
 }
 
 void frame_interp_finalize(void)
@@ -207,8 +220,10 @@ void frame_interp_finalize(void)
     if (@available(macOS 15.4, *)) {
         if (g_interp.processor) {
             [(VTFrameProcessor *)g_interp.processor endSession];
+            [(VTFrameProcessor *)g_interp.processor release];
             g_interp.processor = nil;
         }
+        [(id)g_interp.config release];
         g_interp.config = nil;
     }
 
@@ -228,6 +243,7 @@ void frame_interp_finalize(void)
     }
 
     if (g_interp.queue) {
+        dispatch_release(g_interp.queue);
         g_interp.queue = nil;
     }
 
@@ -254,37 +270,39 @@ static void do_vt_processing(int head, int fc)
         CMTime prev_time = CMTimeMake(fc - 1, 30);
         CMTime curr_time = CMTimeMake(fc, 30);
 
+        // MRC: everything created here is autoreleased and drained by the
+        // enclosing pool when this (synchronous) VT pass returns.
         VTFrameProcessorFrame *src_frame =
-            [[VTFrameProcessorFrame alloc]
+            [[[VTFrameProcessorFrame alloc]
                 initWithBuffer:g_interp.ring[prev_idx]
-                presentationTimeStamp:prev_time];
+                presentationTimeStamp:prev_time] autorelease];
         VTFrameProcessorFrame *next_frame =
-            [[VTFrameProcessorFrame alloc]
+            [[[VTFrameProcessorFrame alloc]
                 initWithBuffer:g_interp.ring[curr_idx]
-                presentationTimeStamp:curr_time];
+                presentationTimeStamp:curr_time] autorelease];
 
         if (!src_frame || !next_frame) {
             return;
         }
 
         VTFrameProcessorFrame *dest_frame =
-            [[VTFrameProcessorFrame alloc]
+            [[[VTFrameProcessorFrame alloc]
                 initWithBuffer:g_interp.interp_output[write_idx]
-                presentationTimeStamp:CMTimeMake(fc * 2 - 1, 60)];
+                presentationTimeStamp:CMTimeMake(fc * 2 - 1, 60)] autorelease];
 
         if (!dest_frame) {
             return;
         }
 
         VTFrameRateConversionParameters *params =
-            [[VTFrameRateConversionParameters alloc]
+            [[[VTFrameRateConversionParameters alloc]
                 initWithSourceFrame:src_frame
                           nextFrame:next_frame
                         opticalFlow:nil
                  interpolationPhase:@[@0.5]
                      submissionMode:
                       VTFrameRateConversionParametersSubmissionModeSequential
-                  destinationFrames:@[dest_frame]];
+                  destinationFrames:@[dest_frame]] autorelease];
 
         if (!params) {
             return;
@@ -357,24 +375,23 @@ void frame_interp_push_frame(IOSurfaceRef surface)
     atomic_store(&g_interp.ring_head, head);
     int fc = atomic_fetch_add(&g_interp.frame_count, 1) + 1;
 
-    // Retain IOSurface for the async block
-    CFRetain(surface);
+    // Copy the pixels NOW, while the caller still holds the display
+    // surface between nv2a_get_framebuffer_surface and its release —
+    // a deferred copy could read a surface Vulkan has already
+    // overwritten with the next frame. ~1ms at 1280x960 on Apple
+    // Silicon. The 3-slot ring guarantees this write never lands in a
+    // slot the (at most one pair behind, coalesced) VT job still reads.
+    do_push_copy(surface, head);
 
-    // Dispatch all heavy work (copy + VT) to background queue.
-    // Capture head and fc by value so the async block uses a snapshot —
+    if (fc < 2) {
+        return;
+    }
+
+    // Only the ANE inference runs async. Capture head and fc by value —
     // the queue may run this block after further pushes have advanced
     // the live counters.
     dispatch_async(g_interp.queue, ^{
         if (!g_interp.initialized) {
-            CFRelease(surface);
-            return;
-        }
-
-        // Copy/scale IOSurface → ring buffer
-        do_push_copy(surface, head);
-        CFRelease(surface);
-
-        if (fc < 2) {
             return;
         }
 
