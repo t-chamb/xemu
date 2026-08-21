@@ -590,13 +590,18 @@ void pgraph_vk_determine_gpu_properties(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHVkState *r = pg->vk_renderer_state;
 
-    // If geometry shaders are unavailable (e.g. MoltenVK/Metal), skip the
-    // winding probe entirely and use known-correct defaults.
-    if (!r->enabled_physical_device_features.geometryShader) {
+    // If geometry shaders are unavailable (e.g. MoltenVK/Metal), the shader
+    // path falls back to VS/FS-only pipelines; the winding probe is
+    // meaningless without a GS.
+    pgraph_vk_gpu_properties.have_geometry_shaders =
+        r->enabled_physical_device_features.geometryShader == VK_TRUE;
+    if (!pgraph_vk_gpu_properties.have_geometry_shaders) {
         pgraph_vk_gpu_properties.geom_shader_winding.tri = 0;
         pgraph_vk_gpu_properties.geom_shader_winding.tri_strip0 = 0;
         pgraph_vk_gpu_properties.geom_shader_winding.tri_strip1 = 0;
         pgraph_vk_gpu_properties.geom_shader_winding.tri_fan = 0;
+        fprintf(stderr,
+                "VK geometry shaders unavailable; using no-GS fallback\n");
         return;
     }
 

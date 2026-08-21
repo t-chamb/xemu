@@ -26,16 +26,24 @@ const char *uniform_element_type_to_str[] = {
 };
 
 MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
-                                    bool in, bool prefix, bool array)
+                                    bool in, bool prefix, bool array,
+                                    bool no_geom)
 {
     const char *smooth_s = "";
     const char *flat_s = "flat ";
+    const char *noperspective_s = "noperspective ";
     const char *qualifier_s = smooth ? smooth_s : flat_s;
     const char *in_out_s = in ? "in" : "out";
     const char *float_s = "float";
     const char *vec4_s = "vec4";
     const char *prefix_s = prefix ? "v_" : "";
     const char *suffix_s = array ? "[]" : "";
+    /* Without a geometry shader the fragment shader cannot receive all three
+     * triangle vertex positions. vtxPos0 is interpolated noperspective
+     * (screen-linear z, matching NV2A depth interpolation) and vtxPos1
+     * perspective-correct (its w gives the w-buffer depth); the fragment
+     * shader substitutes screen-space derivatives for triMZ.
+     */
     const struct {
         const char *qualifier, *type, *name;
     } attr[] = {
@@ -48,8 +56,8 @@ MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
         { smooth_s,    vec4_s,  "vtxT1"  },
         { smooth_s,    vec4_s,  "vtxT2"  },
         { smooth_s,    vec4_s,  "vtxT3"  },
-        { flat_s,      vec4_s,  "vtxPos0" },
-        { flat_s,      vec4_s,  "vtxPos1" },
+        { no_geom ? noperspective_s : flat_s, vec4_s, "vtxPos0" },
+        { no_geom ? smooth_s : flat_s,        vec4_s, "vtxPos1" },
         { flat_s,      vec4_s,  "vtxPos2" },
         { flat_s,      float_s, "triMZ"  },
     };
