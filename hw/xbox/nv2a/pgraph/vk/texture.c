@@ -600,8 +600,10 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
         TexRepDumpFormat dump_fmt;
         if (level0->depth == 1 &&
             texrep_dump_format_for(vkf.vk_format, &dump_fmt)) {
+            bool force_opaque =
+                vkf.component_map.a == VK_COMPONENT_SWIZZLE_ONE;
             texrep_dump(binding->hash, dump_fmt, level0->width,
-                        level0->height, level0->decoded_data);
+                        level0->height, level0->decoded_data, force_opaque);
         }
     }
 

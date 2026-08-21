@@ -270,7 +270,7 @@ static void convert_to_rgba(TexRepDumpFormat fmt, const void *src, int count,
 }
 
 void texrep_dump(uint64_t content_hash, TexRepDumpFormat fmt, int width,
-                 int height, const void *level0_data)
+                 int height, const void *level0_data, bool force_opaque)
 {
     if (!texrep_dump_enabled() || width <= 0 || height <= 0) {
         return;
@@ -288,6 +288,11 @@ void texrep_dump(uint64_t content_hash, TexRepDumpFormat fmt, int width,
 
     g_autofree uint8_t *rgba = g_malloc((size_t)width * height * 4);
     convert_to_rgba(fmt, level0_data, width * height, rgba);
+    if (force_opaque) {
+        for (size_t i = 3; i < (size_t)width * height * 4; i += 4) {
+            rgba[i] = 255;
+        }
+    }
 
     size_t png_size = 0;
     void *png = tdefl_write_image_to_png_file_in_memory_ex(
