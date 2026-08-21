@@ -1034,6 +1034,29 @@ static void gl_render_frame(struct xemu_console *scon)
     }
 
     if (interp_enabled && frame_interp_is_available()) {
+        int drawable_w = 0, drawable_h = 0;
+        SDL_GetWindowSizeInPixels(scon->real_window, &drawable_w, &drawable_h);
+        frame_interp_set_display_size(drawable_w, drawable_h);
+
+        int quality_cap = 0; /* auto */
+        switch (g_config.display.window.frame_interpolation_quality) {
+        case CONFIG_DISPLAY_WINDOW_FRAME_INTERPOLATION_QUALITY_LOW:
+            quality_cap = 640;
+            break;
+        case CONFIG_DISPLAY_WINDOW_FRAME_INTERPOLATION_QUALITY_MEDIUM:
+            quality_cap = 1280;
+            break;
+        case CONFIG_DISPLAY_WINDOW_FRAME_INTERPOLATION_QUALITY_HIGH:
+            quality_cap = 1920;
+            break;
+        case CONFIG_DISPLAY_WINDOW_FRAME_INTERPOLATION_QUALITY_ULTRA:
+            quality_cap = 2560;
+            break;
+        default:
+            break;
+        }
+        frame_interp_set_quality_cap(quality_cap);
+
         int current_frame_time = nv2a_get_frame_time();
 
         if (current_frame_time != g_last_frame_time) {
