@@ -39,9 +39,76 @@
 // async VT job may still be reading.
 #define RING_SIZE 3
 
-// Cap interpolation resolution for performance. VTFrameProcessor has ~15ms
-// of fixed neural engine overhead regardless of resolution.
-#define INTERP_MAX_DIM 1280
+/* Interpolation resolution adapts at runtime. Two caps apply on top of the
+ * source dimensions:
+ *
+ *  - The display drawable size: midpoints are only ever presented at window
+ *    resolution, so interpolating above it is wasted inference.
+ *  - A performance rung, moved along the ladder below. The consumer
+ *    queries results just before pushing the next real frame, so a
+ *    midpoint has one full 30fps period (~33ms) from push to consumption;
+ *    past that it goes stale and cadence degrades to 30fps. Inference has
+ *    a large fixed ANE overhead, so cost is only weakly elastic in
+ *    resolution — stepping down on inference time alone destroys quality
+ *    without buying anything. The rung therefore steps down only when
+ *    midpoints measurably go stale (miss-rate EMA), and steps up only
+ *    when misses are absent and the inference-time EMA, scaled by the
+ *    area ratio of the next rung (a conservative overestimate given the
+ *    fixed overhead), still fits the budget.
+ *
+ * Adaptation state deliberately lives outside g_interp: session re-inits
+ * memset g_interp, and the learned rung must survive them.
+ */
+static const int adapt_ladder[] = { 640, 960, 1280, 1600, 1920, 2560, 3200 };
+#define ADAPT_LADDER_LEN ((int)(sizeof(adapt_ladder) / sizeof(adapt_ladder[0])))
+#define ADAPT_START_IDX 2            /* 1280: known safe on every ANE */
+#define ADAPT_MIN_SAMPLES 60         /* pairs (~2s) between rung decisions */
+#define ADAPT_AUTO_FLOOR_IDX 1       /* auto never drops below 960 */
+#define ADAPT_MISS_STEP_DOWN 0.30    /* miss-rate EMA to step down */
+#define ADAPT_MISS_STEP_UP 0.02      /* miss-rate EMA to allow step up */
+#define ADAPT_BUDGET_MS 30.0         /* usable slice of the ~33ms period */
+
+static struct {
+    _Atomic int perf_idx;            /* ladder index; render thread writes */
+    _Atomic int display_w;           /* last known drawable size */
+    _Atomic int display_h;
+    _Atomic int ema_us;              /* inference EMA, written on VT queue */
+    double miss_ema;                 /* render thread only */
+    int samples;                     /* render thread only */
+    _Atomic bool pinned;             /* UI pinned a rung; stop adapting */
+} g_adapt = { .perf_idx = ADAPT_START_IDX };
+
+/* Round a display dimension up to a ladder rung so live window resizing
+ * only changes the target when it crosses a rung boundary. */
+static int ladder_ceil(int dim)
+{
+    for (int i = 0; i < ADAPT_LADDER_LEN; i++) {
+        if (adapt_ladder[i] >= dim) {
+            return adapt_ladder[i];
+        }
+    }
+    return adapt_ladder[ADAPT_LADDER_LEN - 1];
+}
+
+static void compute_interp_dims(int src_w, int src_h, int *out_w, int *out_h)
+{
+    int cap = adapt_ladder[atomic_load(&g_adapt.perf_idx)];
+    int disp_w = atomic_load(&g_adapt.display_w);
+    int disp_h = atomic_load(&g_adapt.display_h);
+    if (disp_w > 0 && disp_h > 0) {
+        cap = MIN(cap, ladder_ceil(MAX(disp_w, disp_h)));
+    }
+
+    int w = src_w, h = src_h;
+    int max_dim = MAX(w, h);
+    if (max_dim > cap) {
+        float scale = (float)cap / max_dim;
+        w = (int)(w * scale) & ~1; /* keep even */
+        h = (int)(h * scale) & ~1;
+    }
+    *out_w = w;
+    *out_h = h;
+}
 
 static struct {
     bool initialized;
@@ -70,6 +137,60 @@ static struct {
 } g_interp;
 
 static void do_vt_processing(int head, int fc);
+
+/* VT queue thread: record inference wall time. */
+static void adapt_note_sample(double ms)
+{
+    int prev = atomic_load(&g_adapt.ema_us);
+    int cur = (int)(ms * 1000.0);
+    atomic_store(&g_adapt.ema_us,
+                 prev == 0 ? cur : prev + (cur - prev) / 5);
+}
+
+/* Render thread: record whether the previous pair's midpoint was ready in
+ * time to be consumed (miss = it went stale), and move the rung. */
+static void adapt_note_consumption(bool miss)
+{
+    if (atomic_load(&g_adapt.pinned)) {
+        return;
+    }
+    g_adapt.miss_ema += 0.1 * ((miss ? 1.0 : 0.0) - g_adapt.miss_ema);
+    if (++g_adapt.samples < ADAPT_MIN_SAMPLES) {
+        return;
+    }
+
+    int idx = atomic_load(&g_adapt.perf_idx);
+    double ema_ms = atomic_load(&g_adapt.ema_us) / 1000.0;
+    int session_dim = MAX(g_interp.width, g_interp.height);
+
+    if (g_adapt.miss_ema > ADAPT_MISS_STEP_DOWN &&
+        idx > ADAPT_AUTO_FLOOR_IDX) {
+        atomic_store(&g_adapt.perf_idx, idx - 1);
+        fprintf(stderr,
+                "[frame-interp] midpoints stale (%.0f%%, %.1fms): "
+                "cap %d -> %d\n",
+                g_adapt.miss_ema * 100.0, ema_ms, adapt_ladder[idx],
+                adapt_ladder[idx - 1]);
+        g_adapt.miss_ema = 0.0;
+    } else if (g_adapt.miss_ema < ADAPT_MISS_STEP_UP &&
+               idx + 1 < ADAPT_LADDER_LEN &&
+               session_dim >= adapt_ladder[idx]) {
+        /* Only raise while the rung is the binding constraint, and only
+         * when the next rung's estimated cost (area-scaled — conservative,
+         * since much of the cost is fixed overhead) still fits the budget.
+         */
+        double ratio = (double)adapt_ladder[idx + 1] * adapt_ladder[idx + 1] /
+                       ((double)adapt_ladder[idx] * adapt_ladder[idx]);
+        if (ema_ms > 0.0 && ema_ms * ratio < ADAPT_BUDGET_MS) {
+            atomic_store(&g_adapt.perf_idx, idx + 1);
+            fprintf(stderr,
+                    "[frame-interp] headroom (%.1fms): cap %d -> %d\n",
+                    ema_ms, adapt_ladder[idx], adapt_ladder[idx + 1]);
+            g_adapt.miss_ema = 0.0;
+        }
+    }
+    g_adapt.samples = 0;
+}
 
 static CVPixelBufferRef create_iosurface_pixel_buffer(int width, int height)
 {
@@ -124,14 +245,8 @@ bool frame_interp_init(int width, int height)
         g_interp.src_width = width;
         g_interp.src_height = height;
 
-        // Cap interpolation resolution for performance
-        int interp_w = width, interp_h = height;
-        int max_dim = MAX(interp_w, interp_h);
-        if (max_dim > INTERP_MAX_DIM) {
-            float scale = (float)INTERP_MAX_DIM / max_dim;
-            interp_w = (int)(interp_w * scale) & ~1; // keep even
-            interp_h = (int)(interp_h * scale) & ~1;
-        }
+        int interp_w, interp_h;
+        compute_interp_dims(width, height, &interp_w, &interp_h);
         g_interp.width = interp_w;
         g_interp.height = interp_h;
         g_interp.needs_scale = (interp_w != width || interp_h != height);
@@ -311,9 +426,12 @@ static void do_vt_processing(int head, int fc)
         NSError *error = nil;
         VTFrameProcessor *processor =
             (VTFrameProcessor *)g_interp.processor;
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         BOOL ok = [processor processWithParameters:params
                                              error:&error];
         if (ok) {
+            adapt_note_sample(
+                (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
             // Atomically publish the new result with its frame count
             atomic_store(&g_interp.ready_state, (fc << 1) | write_idx);
         }
@@ -364,10 +482,65 @@ static void do_push_copy(IOSurfaceRef surface, int head)
     IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 }
 
+void frame_interp_set_display_size(int width, int height)
+{
+    if (width > 0 && height > 0) {
+        atomic_store(&g_adapt.display_w, width);
+        atomic_store(&g_adapt.display_h, height);
+    }
+}
+
+/* 0 pins nothing (adaptive); otherwise clamp the ladder to the largest rung
+ * not exceeding max_dim and stop adapting. Called from the settings UI.
+ */
+void frame_interp_set_quality_cap(int max_dim)
+{
+    static int applied = -1;
+    if (max_dim == applied) {
+        return;
+    }
+    applied = max_dim;
+    g_adapt.pinned = max_dim > 0;
+    if (g_adapt.pinned) {
+        int idx = 0;
+        while (idx + 1 < ADAPT_LADDER_LEN && adapt_ladder[idx + 1] <= max_dim) {
+            idx++;
+        }
+        atomic_store(&g_adapt.perf_idx, idx);
+    }
+}
+
 void frame_interp_push_frame(IOSurfaceRef surface)
 {
     if (!g_interp.initialized || !surface) {
         return;
+    }
+
+    // Re-init the session when the adaptive target (perf rung, display
+    // size, or a UI-pinned cap) no longer matches the session dimensions.
+    // Rate-limited so a live window resize cannot thrash sessions; each
+    // re-init costs one pair of warm-up frames.
+    int want_w, want_h;
+    compute_interp_dims(g_interp.src_width, g_interp.src_height, &want_w,
+                        &want_h);
+    if (want_w != g_interp.width || want_h != g_interp.height) {
+        static uint64_t last_reinit_ns;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now - last_reinit_ns > 1000000000ull) {
+            last_reinit_ns = now;
+            if (!frame_interp_init(g_interp.src_width,
+                                   g_interp.src_height)) {
+                return;
+            }
+        }
+    }
+
+    // Did the previous pair's midpoint complete in time to be consumed?
+    // (The consumer queried it just before this call.)
+    int fc_old = atomic_load(&g_interp.frame_count);
+    if (fc_old >= 2) {
+        int state = atomic_load(&g_interp.ready_state);
+        adapt_note_consumption(state < 0 || (state >> 1) != fc_old);
     }
 
     // Advance ring head and frame count atomically (main thread only)
