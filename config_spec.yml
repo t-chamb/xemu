@@ -259,7 +259,7 @@ display:
       default: true
     frame_interpolation:
       type: bool
-      default: false
+      default: true
   ui:
     show_menubar:
       type: bool
