@@ -30,7 +30,32 @@
 #include "qemu/lru.h"
 #include "renderer.h"
 
+#include "texrep.h"
+
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
+
+static bool texrep_dump_format_for(VkFormat format, TexRepDumpFormat *out)
+{
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        *out = TEXREP_DUMP_RGBA8;
+        return true;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        *out = TEXREP_DUMP_BGRA8;
+        return true;
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+        *out = TEXREP_DUMP_R5G6B5;
+        return true;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+        *out = TEXREP_DUMP_A1R5G5B5;
+        return true;
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+        *out = TEXREP_DUMP_A4R4G4B4;
+        return true;
+    default:
+        return false;
+    }
+}
 
 static const VkImageType dimensionality_to_vk_image_type[] = {
     0,
@@ -475,6 +500,82 @@ static bool check_texture_possibly_dirty(NV2AState *d,
 
 // FIXME: Make sure we update sampler when data matches. Should we add filtering
 // options to the textureshape?
+/* Upload a texrep replacement image (2D, single layer, full mip chain)
+ * instead of the guest's texture data. The VkImage was created with the
+ * replacement's dimensions and level count.
+ */
+static void upload_replacement_image(PGRAPHState *pg, TextureBinding *binding)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    const TexRepImage *rep = binding->replacement;
+    VkColorFormatInfo vkf =
+        kelvin_color_format_vk_map[binding->key.state.color_format];
+
+    nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
+
+    assert(rep->data_size <=
+           r->storage_buffers[BUFFER_STAGING_SRC].buffer_size);
+
+    uint8_t *mapped_memory_ptr;
+    VK_CHECK(vmaMapMemory(r->allocator,
+                          r->storage_buffers[BUFFER_STAGING_SRC].allocation,
+                          (void *)&mapped_memory_ptr));
+    memcpy(mapped_memory_ptr, rep->data, rep->data_size);
+
+    g_autofree VkBufferImageCopy *regions =
+        g_malloc0_n(rep->levels, sizeof(VkBufferImageCopy));
+    for (int level = 0; level < rep->levels; level++) {
+        regions[level] = (VkBufferImageCopy){
+            .bufferOffset = rep->level_offset[level],
+            .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .imageSubresource.mipLevel = level,
+            .imageSubresource.layerCount = 1,
+            .imageExtent = (VkExtent3D){ rep->level_width[level],
+                                         rep->level_height[level], 1 },
+        };
+    }
+
+    vmaFlushAllocation(r->allocator,
+                       r->storage_buffers[BUFFER_STAGING_SRC].allocation, 0,
+                       VK_WHOLE_SIZE);
+    vmaUnmapMemory(r->allocator,
+                   r->storage_buffers[BUFFER_STAGING_SRC].allocation);
+
+    VkCommandBuffer cmd = pgraph_vk_begin_single_time_commands(pg);
+    pgraph_vk_begin_debug_marker(r, cmd, RGBA_GREEN, __func__);
+
+    VkBufferMemoryBarrier host_barrier = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = r->storage_buffers[BUFFER_STAGING_SRC].buffer,
+        .size = VK_WHOLE_SIZE
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1,
+                         &host_barrier, 0, NULL);
+
+    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
+                                      binding->current_layout,
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    binding->current_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+    vkCmdCopyBufferToImage(cmd, r->storage_buffers[BUFFER_STAGING_SRC].buffer,
+                           binding->image, binding->current_layout,
+                           rep->levels, regions);
+
+    pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
+                                      binding->current_layout,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    binding->current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_4);
+    pgraph_vk_end_debug_marker(r, cmd);
+    pgraph_vk_end_single_time_commands(pg, cmd);
+}
+
 static void upload_texture_image(PGRAPHState *pg, int texture_idx,
                                  TextureBinding *binding)
 {
@@ -482,10 +583,27 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
     TextureShape *state = &binding->key.state;
     VkColorFormatInfo vkf = kelvin_color_format_vk_map[state->color_format];
 
+    if (binding->replacement) {
+        upload_replacement_image(pg, binding);
+        return;
+    }
+
     nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
     g_autofree TextureLayout *layout = get_texture_layout(pg, texture_idx);
     const int num_layers = state->cubemap ? 6 : 1;
+
+    if (texrep_dump_enabled() && state->dimensionality == 2 &&
+        !state->cubemap &&
+        !texrep_is_dynamic(binding->key.texture_vram_offset)) {
+        TextureLevel *level0 = &layout->layers[0].levels[0];
+        TexRepDumpFormat dump_fmt;
+        if (level0->depth == 1 &&
+            texrep_dump_format_for(vkf.vk_format, &dump_fmt)) {
+            texrep_dump(binding->hash, dump_fmt, level0->width,
+                        level0->height, level0->decoded_data);
+        }
+    }
 
     // Calculate decoded texture data size
     size_t texture_data_size = 0;
@@ -1191,13 +1309,26 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             }
         } else {
             if (possibly_dirty && content_hash != snode->hash) {
-                upload_texture_image(pg, texture_idx, snode);
-                snode->hash = content_hash;
+                // In-place guest updates mean this texture is dynamic;
+                // exclude it from replacement for the session.
+                texrep_mark_dynamic(texture_vram_offset);
+                if (snode->replacement) {
+                    // The image is sized for the replacement; release it
+                    // and fall through to recreate at guest dimensions.
+                    texture_cache_release_node_resources(r, snode);
+                    snode->replacement = NULL;
+                    binding_found = false;
+                } else {
+                    snode->hash = content_hash;
+                    upload_texture_image(pg, texture_idx, snode);
+                }
             }
         }
 
-        NV2A_VK_DGROUP_END();
-        return;
+        if (binding_found) {
+            NV2A_VK_DGROUP_END();
+            return;
+        }
     }
 
     NV2A_VK_DPRINTF("Cache miss");
@@ -1206,8 +1337,21 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     snode->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     snode->possibly_dirty = false;
     snode->hash = content_hash;
+    snode->replacement = NULL;
 
     VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
+
+    if (!surface_to_texture && content_hash != 0 &&
+        state.dimensionality == 2 && !state.cubemap &&
+        !texrep_is_dynamic(texture_vram_offset) &&
+        (vkf.vk_format == VK_FORMAT_R8G8B8A8_UNORM ||
+         vkf.vk_format == VK_FORMAT_B8G8R8A8_UNORM)) {
+        snode->replacement =
+            texrep_lookup(content_hash,
+                          vkf.vk_format == VK_FORMAT_B8G8R8A8_UNORM ?
+                              TEXREP_ORDER_BGRA8 :
+                              TEXREP_ORDER_RGBA8);
+    }
     assert(vkf.vk_format != 0);
     assert(0 < state.dimensionality);
     assert(state.dimensionality < ARRAY_SIZE(dimensionality_to_vk_image_type));
@@ -1234,6 +1378,12 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     if (surface_to_texture) {
         pgraph_apply_scaling_factor(pg, &image_create_info.extent.width,
                                         &image_create_info.extent.height);
+    }
+
+    if (snode->replacement) {
+        image_create_info.extent.width = snode->replacement->width;
+        image_create_info.extent.height = snode->replacement->height;
+        image_create_info.mipLevels = snode->replacement->levels;
     }
 
     VmaAllocationCreateInfo alloc_create_info = {
@@ -1459,6 +1609,7 @@ static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     snode->image = VK_NULL_HANDLE;
     snode->allocation = VK_NULL_HANDLE;
     snode->image_view = VK_NULL_HANDLE;
+    snode->replacement = NULL;
     snode->sampler = VK_NULL_HANDLE;
 }
 
@@ -1554,6 +1705,7 @@ void pgraph_vk_init_textures(PGRAPHState *pg)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
 
+    texrep_init();
     texture_cache_init(r);
     create_dummy_texture(pg);
 
@@ -1578,6 +1730,7 @@ void pgraph_vk_finalize_textures(PGRAPHState *pg)
 
     destroy_dummy_texture(r);
     texture_cache_finalize(r);
+    texrep_finalize();
 
     assert(r->texture_cache.num_used == 0);
 
