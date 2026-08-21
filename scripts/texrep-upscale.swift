@@ -91,6 +91,35 @@ func makePixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
     return pb
 }
 
+/* Reinterpret an image's pixels as opaque, so drawing preserves the raw
+ * color channels instead of premultiplying them by alpha. Textures store
+ * meaningful color under transparent regions (glyph sheets especially);
+ * premultiplication would turn those regions black and the scaler would
+ * bake dark halos into every edge. */
+func opaqueView(of image: CGImage) -> CGImage {
+    guard image.bitsPerPixel == 32, let provider = image.dataProvider else {
+        return image
+    }
+    let alphaInfo = image.alphaInfo
+    guard alphaInfo != .none && alphaInfo != .noneSkipFirst &&
+          alphaInfo != .noneSkipLast else {
+        return image
+    }
+    let skip: CGImageAlphaInfo =
+        (alphaInfo == .premultipliedFirst || alphaInfo == .first) ?
+            .noneSkipFirst : .noneSkipLast
+    let info = CGBitmapInfo(rawValue:
+        (image.bitmapInfo.rawValue & ~CGBitmapInfo.alphaInfoMask.rawValue) |
+        skip.rawValue)
+    return CGImage(
+        width: image.width, height: image.height,
+        bitsPerComponent: image.bitsPerComponent,
+        bitsPerPixel: image.bitsPerPixel, bytesPerRow: image.bytesPerRow,
+        space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: info, provider: provider, decode: nil,
+        shouldInterpolate: false, intent: .defaultIntent) ?? image
+}
+
 func draw(_ image: CGImage, into pb: CVPixelBuffer) {
     CVPixelBufferLockBaseAddress(pb, [])
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
@@ -99,11 +128,12 @@ func draw(_ image: CGImage, into pb: CVPixelBuffer) {
         width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb),
         bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
         space: CGColorSpace(name: CGColorSpace.sRGB)!,
-        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue |
+        bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue |
                     CGBitmapInfo.byteOrder32Little.rawValue)!
     ctx.interpolationQuality = .none
-    ctx.draw(image, in: CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(pb),
-                               height: CVPixelBufferGetHeight(pb)))
+    ctx.draw(opaqueView(of: image),
+             in: CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(pb),
+                        height: CVPixelBufferGetHeight(pb)))
 }
 
 func cgImage(from pb: CVPixelBuffer) -> CGImage? {
@@ -132,17 +162,35 @@ func upscaledAlpha(_ image: CGImage, width: Int, height: Int) -> [UInt8] {
     return alpha
 }
 
-func applyAlpha(_ alpha: [UInt8], to pb: CVPixelBuffer) {
+/* Combine the scaler's BGRA output with a separately-upscaled straight
+ * alpha channel into a straight-alpha RGBA image, bypassing any
+ * premultiply/unpremultiply round trip. */
+func assembleStraightRGBA(from pb: CVPixelBuffer, alpha: [UInt8]) -> CGImage? {
     CVPixelBufferLockBaseAddress(pb, [])
     defer { CVPixelBufferUnlockBaseAddress(pb, []) }
     let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
     let stride = CVPixelBufferGetBytesPerRow(pb)
     let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+    var rgba = [UInt8](repeating: 0, count: w * h * 4)
     for y in 0..<h {
         for x in 0..<w {
-            base[y * stride + x * 4 + 3] = alpha[y * w + x]
+            let s = y * stride + x * 4
+            let d = (y * w + x) * 4
+            rgba[d + 0] = base[s + 2]   // B G R A -> R
+            rgba[d + 1] = base[s + 1]
+            rgba[d + 2] = base[s + 0]
+            rgba[d + 3] = alpha[y * w + x]
         }
     }
+    guard let provider = CGDataProvider(data: Data(rgba) as CFData) else {
+        return nil
+    }
+    return CGImage(
+        width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+        bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+        provider: provider, decode: nil, shouldInterpolate: false,
+        intent: .defaultIntent)
 }
 
 @available(macOS 26.0, *)
@@ -262,9 +310,8 @@ for name in entries {
     guard let dst = scaler.upscale(src) else { failed += 1; continue }
 
     let alpha = upscaledAlpha(image, width: w * SCALE, height: h * SCALE)
-    applyAlpha(alpha, to: dst)
-
-    guard let out = cgImage(from: dst), writePNG(out, to: outPath) else {
+    guard let out = assembleStraightRGBA(from: dst, alpha: alpha),
+          writePNG(out, to: outPath) else {
         failed += 1
         continue
     }
