@@ -89,7 +89,6 @@ static GLuint g_interp_read_fbo = 0;
 static GLuint g_interp_draw_fbo = 0;
 static int g_interp_width = 0;
 static int g_interp_height = 0;
-static GLuint g_last_real_tex = 0;
 /* Hold ring: GL copies of the two most recent real frames, so a real frame
  * can be presented one display tick after its leading midpoint. */
 static GLuint g_hold_tex[2];
@@ -101,6 +100,15 @@ static int g_hold_cur = 0;
 static int g_hold_count = 0;
 /* Pair id (interpolator frame count) of the last presented midpoint */
 static int g_mid_shown_fc = 0;
+/* Consecutive display ticks without a guest flip. Past a small bound the
+ * guest has stopped flipping (e.g. CPU blits to the VGA framebuffer) and
+ * presentation must fall back to the normal per-tick sync path. */
+static int g_repeat_ticks = 0;
+/* Identity of the display IOSurface frames are pushed from; a change
+ * means the display image was recreated (resolution/scale change). */
+static uint32_t g_last_surface_id = 0;
+static int g_last_surface_width = 0;
+static int g_last_surface_height = 0;
 #endif
 
 struct xemu_console {
@@ -837,6 +845,10 @@ static void interp_display_reset(void)
     g_last_frame_time = -1;
     g_mid_shown_fc = 0;
     g_hold_count = 0;
+    g_repeat_ticks = 0;
+    g_last_surface_id = 0;
+    g_last_surface_width = 0;
+    g_last_surface_height = 0;
     if (g_interp_gl_tex) {
         glDeleteTextures(1, &g_interp_gl_tex);
         glDeleteTextures(1, &g_interp_rect_tex);
@@ -1033,22 +1045,33 @@ static void gl_render_frame(struct xemu_console *scon)
 
             assert(glGetError() == GL_NO_ERROR);
 
-            if (real_tex != 0) {
-                /* Display image recreated (resize): reset and re-warm */
-                if (real_tex != g_last_real_tex && g_last_real_tex != 0) {
-                    interp_display_reset();
-                }
-                g_last_real_tex = real_tex;
+            g_repeat_ticks = 0;
 
+            if (real_tex != 0) {
                 IOSurfaceRef display_surface = nv2a_get_display_iosurface();
                 if (display_surface) {
                     /* Retain to protect against concurrent display image
                      * recreation. */
                     CFRetain(display_surface);
+
+                    /* Display image recreated (resolution or scale
+                     * change): reset and re-warm. GL texture names get
+                     * recycled, so key on the IOSurface identity. */
+                    uint32_t sid = IOSurfaceGetID(display_surface);
+                    int sw = (int)IOSurfaceGetWidth(display_surface);
+                    int sh = (int)IOSurfaceGetHeight(display_surface);
+                    if (g_last_surface_id != 0 &&
+                        (sid != g_last_surface_id ||
+                         sw != g_last_surface_width ||
+                         sh != g_last_surface_height)) {
+                        interp_display_reset();
+                    }
+                    g_last_surface_id = sid;
+                    g_last_surface_width = sw;
+                    g_last_surface_height = sh;
+
                     if (!g_interp_initialized) {
-                        int w = (int)IOSurfaceGetWidth(display_surface);
-                        int h = (int)IOSurfaceGetHeight(display_surface);
-                        if (frame_interp_init(w, h)) {
+                        if (frame_interp_init(sw, sh)) {
                             g_interp_initialized = true;
                         }
                     }
@@ -1076,6 +1099,11 @@ static void gl_render_frame(struct xemu_console *scon)
                         frame_interp_push_frame(display_surface);
                     }
                     CFRelease(display_surface);
+                } else if (g_interp_initialized) {
+                    /* Renderer no longer exposes an IOSurface (e.g. a
+                     * switch to the GL renderer): tear interpolation
+                     * down and present normally. */
+                    interp_display_reset();
                 }
                 if (tex == 0) {
                     /* Warm-up: fewer than two held frames, show directly */
@@ -1084,22 +1112,31 @@ static void gl_render_frame(struct xemu_console *scon)
             }
             g_last_frame_time = current_frame_time;
         } else if (g_interp_initialized && g_hold_count >= 2) {
-            /* Repeated frame — no Vulkan sync needed. Show the newest
-             * pair's midpoint once it lands; until then the previous
-             * real frame; after it, the newest real frame. */
-            int mid_fc = 0;
-            IOSurfaceRef mid = frame_interp_get_interpolated(&mid_fc);
-            if (mid && mid_fc != g_mid_shown_fc) {
-                tex = interp_bind_surface(mid);
-                if (tex != 0) {
-                    g_mid_shown_fc = mid_fc;
+            g_repeat_ticks++;
+            if (g_repeat_ticks > 4) {
+                /* The guest has stopped flipping (e.g. CPU blits to the
+                 * VGA framebuffer). Stop substituting held frames so the
+                 * per-tick sync below runs again — restoring the VGA
+                 * fallback — and re-warm when flips resume. */
+                g_hold_count = 0;
+            } else {
+                /* Repeated frame — no Vulkan sync needed. Show the
+                 * newest pair's midpoint once it lands; until then the
+                 * previous real frame; after it, the newest real frame. */
+                int mid_fc = 0;
+                IOSurfaceRef mid = frame_interp_get_interpolated(&mid_fc);
+                if (mid && mid_fc != g_mid_shown_fc) {
+                    tex = interp_bind_surface(mid);
+                    if (tex != 0) {
+                        g_mid_shown_fc = mid_fc;
+                    }
                 }
-            }
-            if (tex == 0) {
-                bool mid_was_shown =
-                    g_mid_shown_fc == frame_interp_frame_count();
-                tex = g_hold_tex[mid_was_shown ? g_hold_cur
-                                               : (g_hold_cur ^ 1)];
+                if (tex == 0) {
+                    bool mid_was_shown =
+                        g_mid_shown_fc == frame_interp_frame_count();
+                    tex = g_hold_tex[mid_was_shown ? g_hold_cur
+                                                   : (g_hold_cur ^ 1)];
+                }
             }
         }
     }
@@ -1141,8 +1178,11 @@ static void gl_render_frame(struct xemu_console *scon)
     xemu_hud_update();
     xemu_main_loop_unlock();
 
+    /* Full finish, not flush: the next tick lets the nv2a renderer
+     * overwrite the framebuffer texture we just sampled, so every read
+     * must have completed — a flush only guarantees submission. */
     xemu_hud_render();
-    glFlush();
+    glFinish();
 
     if (release_surface_texture) {
         xemu_main_loop_lock();
