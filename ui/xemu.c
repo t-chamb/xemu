@@ -90,6 +90,17 @@ static GLuint g_interp_draw_fbo = 0;
 static int g_interp_width = 0;
 static int g_interp_height = 0;
 static GLuint g_last_real_tex = 0;
+/* Hold ring: GL copies of the two most recent real frames, so a real frame
+ * can be presented one display tick after its leading midpoint. */
+static GLuint g_hold_tex[2];
+static GLuint g_hold_read_fbo = 0;
+static GLuint g_hold_draw_fbo = 0;
+static int g_hold_width = 0;
+static int g_hold_height = 0;
+static int g_hold_cur = 0;
+static int g_hold_count = 0;
+/* Pair id (interpolator frame count) of the last presented midpoint */
+static int g_mid_shown_fc = 0;
 #endif
 
 struct xemu_console {
@@ -815,6 +826,150 @@ static void report_stats(void)
 }
 #endif
 
+#if defined(__APPLE__)
+/* Tear down all frame-interpolation display state (GL context current) */
+static void interp_display_reset(void)
+{
+    if (g_interp_initialized) {
+        frame_interp_finalize();
+        g_interp_initialized = false;
+    }
+    g_last_frame_time = -1;
+    g_mid_shown_fc = 0;
+    g_hold_count = 0;
+    if (g_interp_gl_tex) {
+        glDeleteTextures(1, &g_interp_gl_tex);
+        glDeleteTextures(1, &g_interp_rect_tex);
+        glDeleteFramebuffers(1, &g_interp_read_fbo);
+        glDeleteFramebuffers(1, &g_interp_draw_fbo);
+        g_interp_gl_tex = 0;
+        g_interp_rect_tex = 0;
+        g_interp_read_fbo = 0;
+        g_interp_draw_fbo = 0;
+    }
+    if (g_hold_tex[0]) {
+        glDeleteTextures(2, g_hold_tex);
+        glDeleteFramebuffers(1, &g_hold_read_fbo);
+        glDeleteFramebuffers(1, &g_hold_draw_fbo);
+        g_hold_tex[0] = g_hold_tex[1] = 0;
+        g_hold_read_fbo = 0;
+        g_hold_draw_fbo = 0;
+        g_hold_width = 0;
+        g_hold_height = 0;
+    }
+}
+
+/* Copy the freshly synced real frame into the hold ring so it can be
+ * presented one tick later, after its leading midpoint. */
+static void hold_ring_store(GLuint tex)
+{
+    int w = 0, h = 0;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (w == 0 || h == 0) {
+        return;
+    }
+
+    if (g_hold_tex[0] == 0 || w != g_hold_width || h != g_hold_height) {
+        if (g_hold_tex[0]) {
+            glDeleteTextures(2, g_hold_tex);
+            glDeleteFramebuffers(1, &g_hold_read_fbo);
+            glDeleteFramebuffers(1, &g_hold_draw_fbo);
+        }
+        glGenTextures(2, g_hold_tex);
+        for (int i = 0; i < 2; i++) {
+            glBindTexture(GL_TEXTURE_2D, g_hold_tex[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glGenFramebuffers(1, &g_hold_read_fbo);
+        glGenFramebuffers(1, &g_hold_draw_fbo);
+        g_hold_width = w;
+        g_hold_height = h;
+        g_hold_cur = 0;
+        g_hold_count = 0;
+    }
+
+    int next = g_hold_cur ^ 1;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_hold_read_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_hold_draw_fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, g_hold_tex[next], 0);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g_hold_cur = next;
+    if (g_hold_count < 2) {
+        g_hold_count++;
+    }
+}
+
+/* Bind an interpolated IOSurface to a GL_TEXTURE_2D (rectangle texture +
+ * FBO blit) and return the texture, or 0 on failure. */
+static GLuint interp_bind_surface(IOSurfaceRef interp_surface)
+{
+    int w = (int)IOSurfaceGetWidth(interp_surface);
+    int h = (int)IOSurfaceGetHeight(interp_surface);
+
+    /* Lazily create GL resources, recreate on resize */
+    if (g_interp_gl_tex == 0 || w != g_interp_width || h != g_interp_height) {
+        if (g_interp_gl_tex) {
+            glDeleteTextures(1, &g_interp_gl_tex);
+            glDeleteTextures(1, &g_interp_rect_tex);
+            glDeleteFramebuffers(1, &g_interp_read_fbo);
+            glDeleteFramebuffers(1, &g_interp_draw_fbo);
+        }
+        g_interp_width = w;
+        g_interp_height = h;
+
+        glGenTextures(1, &g_interp_rect_tex);
+        glGenTextures(1, &g_interp_gl_tex);
+
+        glBindTexture(GL_TEXTURE_2D, g_interp_gl_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        glGenFramebuffers(1, &g_interp_read_fbo);
+        glGenFramebuffers(1, &g_interp_draw_fbo);
+
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_interp_draw_fbo);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, g_interp_gl_tex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    /* Re-bind IOSurface to rect texture each frame */
+    glBindTexture(GL_TEXTURE_RECTANGLE, g_interp_rect_tex);
+    CGLError err = CGLTexImageIOSurface2D(
+        CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE, GL_RGBA8, w, h,
+        GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, interp_surface, 0);
+    glBindTexture(GL_TEXTURE_RECTANGLE, 0);
+    if (err != kCGLNoError) {
+        return 0;
+    }
+
+    /* Blit RECTANGLE → 2D */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_interp_read_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_RECTANGLE, g_interp_rect_tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_interp_draw_fbo);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    return g_interp_gl_tex;
+}
+#endif
+
 /**
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
@@ -846,141 +1001,49 @@ static void gl_render_frame(struct xemu_console *scon)
      */
 #if defined(__APPLE__)
     /*
-     * Frame interpolation fast path: check if this is a repeated frame
-     * BEFORE doing the expensive Vulkan sync. If repeated, skip the sync
-     * entirely and show an interpolated frame instead.
+     * Frame interpolation presentation. Real frames are held for one
+     * display tick so the ANE-computed midpoint of (previous, current)
+     * can be shown between them; every presented frame then moves
+     * strictly forward in time:
+     *
+     *     ..., N-1, mid(N-1,N), N, mid(N,N+1), N+1, ...
+     *
+     * A midpoint that misses its deadline is replaced by the held real
+     * frame, degrading to ordinary 30fps cadence — never a backwards
+     * step. Cost: one game frame (~33ms) of added display latency while
+     * the feature is enabled.
      */
     GLuint tex = 0;
     bool interp_enabled = g_config.display.window.frame_interpolation;
-    bool interp_active = interp_enabled &&
-                         frame_interp_is_available() &&
-                         g_last_real_tex != 0;
 
     /* Tear down interpolation state when toggled off */
     if (!interp_enabled && g_interp_initialized) {
-        frame_interp_finalize();
-        g_interp_initialized = false;
-        g_last_frame_time = -1;
-        if (g_interp_gl_tex) {
-            glDeleteTextures(1, &g_interp_gl_tex);
-            glDeleteTextures(1, &g_interp_rect_tex);
-            glDeleteFramebuffers(1, &g_interp_read_fbo);
-            glDeleteFramebuffers(1, &g_interp_draw_fbo);
-            g_interp_gl_tex = 0;
-            g_interp_rect_tex = 0;
-            g_interp_read_fbo = 0;
-            g_interp_draw_fbo = 0;
-        }
+        interp_display_reset();
     }
 
-    if (interp_active) {
+    if (interp_enabled && frame_interp_is_available()) {
         int current_frame_time = nv2a_get_frame_time();
 
-        if (current_frame_time == g_last_frame_time &&
-            g_interp_initialized) {
-            /* Repeated frame — skip Vulkan sync, use interpolation */
-            IOSurfaceRef interp_surface =
-                frame_interp_get_interpolated();
-            if (interp_surface) {
-                int w = (int)IOSurfaceGetWidth(interp_surface);
-                int h = (int)IOSurfaceGetHeight(interp_surface);
+        if (current_frame_time != g_last_frame_time) {
+            /* New real frame: sync it, store it in the hold ring, and
+             * present the midpoint leading up to it (or, if that missed
+             * its deadline, the previous real frame). */
+            GLuint real_tex = nv2a_get_framebuffer_surface();
+            did_get_surface = true;
 
-                /* Lazily create GL resources, recreate on resize */
-                if (g_interp_gl_tex == 0 ||
-                    w != g_interp_width || h != g_interp_height) {
-                    if (g_interp_gl_tex) {
-                        glDeleteTextures(1, &g_interp_gl_tex);
-                        glDeleteTextures(1, &g_interp_rect_tex);
-                        glDeleteFramebuffers(1, &g_interp_read_fbo);
-                        glDeleteFramebuffers(1, &g_interp_draw_fbo);
-                    }
-                    g_interp_width = w;
-                    g_interp_height = h;
+            assert(glGetError() == GL_NO_ERROR);
 
-                    glGenTextures(1, &g_interp_rect_tex);
-                    glGenTextures(1, &g_interp_gl_tex);
-
-                    glBindTexture(GL_TEXTURE_2D, g_interp_gl_tex);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                                 w, h, 0,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                    glTexParameteri(GL_TEXTURE_2D,
-                                    GL_TEXTURE_MIN_FILTER,
-                                    GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D,
-                                    GL_TEXTURE_MAG_FILTER,
-                                    GL_LINEAR);
-
-                    glGenFramebuffers(1, &g_interp_read_fbo);
-                    glGenFramebuffers(1, &g_interp_draw_fbo);
-
-                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
-                                      g_interp_draw_fbo);
-                    glFramebufferTexture2D(
-                        GL_DRAW_FRAMEBUFFER,
-                        GL_COLOR_ATTACHMENT0,
-                        GL_TEXTURE_2D, g_interp_gl_tex, 0);
-                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (real_tex != 0) {
+                /* Display image recreated (resize): reset and re-warm */
+                if (real_tex != g_last_real_tex && g_last_real_tex != 0) {
+                    interp_display_reset();
                 }
+                g_last_real_tex = real_tex;
 
-                /* Re-bind IOSurface to rect texture each frame */
-                glBindTexture(GL_TEXTURE_RECTANGLE,
-                              g_interp_rect_tex);
-                CGLTexImageIOSurface2D(
-                    CGLGetCurrentContext(),
-                    GL_TEXTURE_RECTANGLE, GL_RGBA8, w, h,
-                    GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-                    interp_surface, 0);
-
-                /* Blit RECTANGLE → 2D */
-                glBindFramebuffer(GL_READ_FRAMEBUFFER,
-                                  g_interp_read_fbo);
-                glFramebufferTexture2D(
-                    GL_READ_FRAMEBUFFER,
-                    GL_COLOR_ATTACHMENT0,
-                    GL_TEXTURE_RECTANGLE,
-                    g_interp_rect_tex, 0);
-                glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
-                                  g_interp_draw_fbo);
-                glBlitFramebuffer(0, 0, w, h,
-                                  0, 0, w, h,
-                                  GL_COLOR_BUFFER_BIT,
-                                  GL_NEAREST);
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-                tex = g_interp_gl_tex;
-            } else {
-                /* Interpolation not ready, reuse last real texture */
-                tex = g_last_real_tex;
-            }
-        }
-    }
-
-    if (tex == 0) {
-        /* New frame or interpolation not active — do full Vulkan sync */
-        tex = nv2a_get_framebuffer_surface();
-        did_get_surface = true;
-
-        assert(glGetError() == GL_NO_ERROR);
-
-        if (tex != 0 && interp_enabled && frame_interp_is_available()) {
-            /* Detect display resize: texture ID changes when the
-             * display image is recreated. Reset interpolation state. */
-            if (tex != g_last_real_tex && g_last_real_tex != 0) {
-                if (g_interp_initialized) {
-                    frame_interp_finalize();
-                    g_interp_initialized = false;
-                }
-                g_last_frame_time = -1;
-            }
-
-            int current_frame_time = nv2a_get_frame_time();
-            if (current_frame_time != g_last_frame_time) {
-                IOSurfaceRef display_surface =
-                    nv2a_get_display_iosurface();
+                IOSurfaceRef display_surface = nv2a_get_display_iosurface();
                 if (display_surface) {
-                    /* Retain to protect against concurrent
-                     * display image recreation. */
+                    /* Retain to protect against concurrent display image
+                     * recreation. */
                     CFRetain(display_surface);
                     if (!g_interp_initialized) {
                         int w = (int)IOSurfaceGetWidth(display_surface);
@@ -990,14 +1053,63 @@ static void gl_render_frame(struct xemu_console *scon)
                         }
                     }
                     if (g_interp_initialized) {
+                        hold_ring_store(real_tex);
+
+                        /* Query before pushing so the freshness gate
+                         * refers to the pair ending at the previous
+                         * real frame. */
+                        if (g_hold_count >= 2) {
+                            int mid_fc = 0;
+                            IOSurfaceRef mid =
+                                frame_interp_get_interpolated(&mid_fc);
+                            if (mid && mid_fc != g_mid_shown_fc) {
+                                tex = interp_bind_surface(mid);
+                                if (tex != 0) {
+                                    g_mid_shown_fc = mid_fc;
+                                }
+                            }
+                            if (tex == 0) {
+                                /* Previous real frame */
+                                tex = g_hold_tex[g_hold_cur ^ 1];
+                            }
+                        }
                         frame_interp_push_frame(display_surface);
                     }
                     CFRelease(display_surface);
                 }
-                g_last_frame_time = current_frame_time;
+                if (tex == 0) {
+                    /* Warm-up: fewer than two held frames, show directly */
+                    tex = real_tex;
+                }
             }
-            g_last_real_tex = tex;
+            g_last_frame_time = current_frame_time;
+        } else if (g_interp_initialized && g_hold_count >= 2) {
+            /* Repeated frame — no Vulkan sync needed. Show the newest
+             * pair's midpoint once it lands; until then the previous
+             * real frame; after it, the newest real frame. */
+            int mid_fc = 0;
+            IOSurfaceRef mid = frame_interp_get_interpolated(&mid_fc);
+            if (mid && mid_fc != g_mid_shown_fc) {
+                tex = interp_bind_surface(mid);
+                if (tex != 0) {
+                    g_mid_shown_fc = mid_fc;
+                }
+            }
+            if (tex == 0) {
+                bool mid_was_shown =
+                    g_mid_shown_fc == frame_interp_frame_count();
+                tex = g_hold_tex[mid_was_shown ? g_hold_cur
+                                               : (g_hold_cur ^ 1)];
+            }
         }
+    }
+
+    if (tex == 0 && !did_get_surface) {
+        /* Interpolation disabled or still warming up */
+        tex = nv2a_get_framebuffer_surface();
+        did_get_surface = true;
+
+        assert(glGetError() == GL_NO_ERROR);
     }
 #else
     GLuint tex = nv2a_get_framebuffer_surface();

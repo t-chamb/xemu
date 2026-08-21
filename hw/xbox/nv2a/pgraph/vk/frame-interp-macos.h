@@ -40,11 +40,15 @@ void frame_interp_finalize(void);
 /* Push a new real frame's IOSurface into the ring buffer */
 void frame_interp_push_frame(IOSurfaceRef surface);
 
-/* Generate an interpolated frame between the two most recent pushed frames.
- * Returns the IOSurface of the interpolated frame, or NULL if not enough
- * frames have been pushed or interpolation fails. The returned IOSurface
- * is owned by the interpolator and valid until the next call. */
-IOSurfaceRef frame_interp_get_interpolated(void);
+/* Number of frames pushed since init (0 if not initialized) */
+int frame_interp_frame_count(void);
+
+/* Midpoint of the two most recently pushed frames, or NULL if it has not
+ * finished computing yet (never returns an older pair's midpoint — showing
+ * one would step motion backwards). On success *out_fc receives the frame
+ * count identifying the pair. The returned IOSurface is owned by the
+ * interpolator and remains valid until the next newer result publishes. */
+IOSurfaceRef frame_interp_get_interpolated(int *out_fc);
 
 #ifdef __cplusplus
 }
