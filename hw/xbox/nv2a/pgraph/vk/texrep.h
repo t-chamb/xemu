@@ -85,9 +85,13 @@ void texrep_mark_dynamic(uint64_t vram_offset);
 bool texrep_is_dynamic(uint64_t vram_offset);
 
 /* Write the (level 0) original out as a canonical RGBA8 PNG, once per
- * hash. No-op if the file already exists. */
+ * hash. No-op if the file already exists. force_opaque must be set for
+ * formats whose alpha channel is ignored by the view swizzle (X8R8G8B8
+ * style): their stored alpha bytes are junk (frequently zero), and
+ * propagating them into the PNG makes every alpha-aware scaler
+ * premultiply the color channels to black. */
 void texrep_dump(uint64_t content_hash, TexRepDumpFormat fmt, int width,
-                 int height, const void *level0_data);
+                 int height, const void *level0_data, bool force_opaque);
 
 #ifdef __cplusplus
 }
