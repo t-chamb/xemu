@@ -224,11 +224,18 @@ most_recent_macosx_sdk_ver () {
   unset IFS
 
   local newest_sdk_ver="${sdks[0]}"
-
   local sdk_path="${macos_sdk_base}/MacOSX${newest_sdk_ver}.sdk"
+
+  # No (suitable) Command Line Tools SDK: fall back to whatever SDK the
+  # active developer directory provides (e.g. a full Xcode install).
   if ! test -d "${sdk_path}"; then
-    echo ""
-    return
+    sdk_path="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)"
+    newest_sdk_ver="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null)"
+    if [[ -z "${sdk_path}" || -z "${newest_sdk_ver}" ]] ||
+       ! test -d "${sdk_path}"; then
+      echo ""
+      return
+    fi
   fi
 
   if ! LC_ALL=C awk 'BEGIN {exit ('${newest_sdk_ver}' < '${min_ver}')}'; then
@@ -260,6 +267,13 @@ case "$platform" in # Adjust compilation options based on platform
         if [[ -z "${sdk}" ]]; then
           echo "SDK >= ${macos_min_ver} not found. Install Xcode Command Line Tools"
           exit 1
+        fi
+
+        # Meson configures this as a cross build and will only take CMake
+        # (needed for the glslang subproject) from a machine file or the
+        # CMAKE environment variable — it ignores PATH.
+        if [[ -z "${CMAKE}" ]] && command -v cmake >/dev/null; then
+          export CMAKE="$(command -v cmake)"
         fi
 
         python3 ./scripts/download-macos-libs.py ${target_arch}
