@@ -812,7 +812,8 @@ static MString* psh_convert(struct PixelShader *ps)
 {
     MString *preflight = mstring_new();
     pgraph_glsl_get_vtx_header(preflight, ps->opts.vulkan,
-                             ps->state->smooth_shading, true, false, false);
+                               ps->state->smooth_shading, true, false, false,
+                               ps->opts.no_geom);
 
     if (ps->opts.vulkan) {
         mstring_append_fmt(
@@ -1001,7 +1002,45 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
-    if (ps->state->z_perspective) {
+    if (ps->opts.no_geom) {
+        /* No geometry shader: the three triangle vertex positions are not
+         * available. vtxPos0 is interpolated noperspective, so its z is
+         * already the screen-linear depth the barycentric path computes;
+         * vtxPos1 is perspective-correct, so its w is the w-buffer depth.
+         * Screen-space derivatives (scaled back to unscaled surface pixels)
+         * substitute for the geometry shader's per-triangle max z slope.
+         */
+        if (ps->state->z_perspective) {
+            mstring_append(
+                clip,
+                "precise float zvalue = vtxPos1.w;\n"
+                "vec2 mz_dv = vec2(dFdx(zvalue), dFdy(zvalue)) * vec2(surfaceScale);\n"
+                "float triMZd = max(abs(mz_dv.x), abs(mz_dv.y));\n"
+                "if (isnan(triMZd) || isinf(triMZd)) {\n"
+                "  triMZd = 0.0;\n"
+                "}\n"
+                "if (zvalue > 0.0) {\n"
+                "  zvalue += depthOffset;\n"
+                "  zvalue += depthFactor*triMZd;\n"
+                "} else {\n"
+                "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+                "}\n"
+                "if (isnan(zvalue)) {\n"
+                "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+                "}\n");
+        } else {
+            mstring_append(
+                clip,
+                "precise float zvalue = vtxPos0.z;\n"
+                "vec2 mz_dv = vec2(dFdx(zvalue), dFdy(zvalue)) * vec2(surfaceScale);\n"
+                "float triMZd = max(abs(mz_dv.x), abs(mz_dv.y));\n"
+                "if (isnan(triMZd) || isinf(triMZd)) {\n"
+                "  triMZd = 0.0;\n"
+                "}\n"
+                "zvalue += depthOffset;\n"
+                "zvalue += depthFactor*triMZd;\n");
+        }
+    } else if (ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"

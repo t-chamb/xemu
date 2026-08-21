@@ -264,7 +264,10 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
 
     ShaderModuleCacheKey key;
 
-    bool need_geometry_shader = pgraph_glsl_need_geom(&binding->state.geom);
+    bool have_geometry_shaders =
+        r->enabled_physical_device_features.geometryShader == VK_TRUE;
+    bool need_geometry_shader =
+        have_geometry_shaders && pgraph_glsl_need_geom(&binding->state.geom);
     if (need_geometry_shader) {
         memset(&key, 0, sizeof(key));
         key.kind = VK_SHADER_STAGE_GEOMETRY_BIT;
@@ -280,6 +283,7 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     key.vsh.state = binding->state.vsh;
     key.vsh.glsl_opts.vulkan = true;
     key.vsh.glsl_opts.prefix_outputs = need_geometry_shader;
+    key.vsh.glsl_opts.no_geom = !have_geometry_shaders;
     key.vsh.glsl_opts.use_push_constants_for_uniform_attrs =
         r->use_push_constants_for_uniform_attrs;
     key.vsh.glsl_opts.ubo_binding = VSH_UBO_BINDING;
@@ -289,6 +293,7 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     key.kind = VK_SHADER_STAGE_FRAGMENT_BIT;
     key.psh.state = binding->state.psh;
     key.psh.glsl_opts.vulkan = true;
+    key.psh.glsl_opts.no_geom = !have_geometry_shaders;
     key.psh.glsl_opts.ubo_binding = PSH_UBO_BINDING;
     key.psh.glsl_opts.tex_binding = PSH_TEX_BINDING;
     binding->psh.module_info = get_and_ref_shader_module_for_key(r, &key);

@@ -338,6 +338,8 @@ void pgraph_gl_determine_gpu_properties(void)
     const int width = 640;
     const int height = 480;
 
+    pgraph_gl_gpu_properties.have_geometry_shaders = true;
+
     uint8_t *pixels = render_geom_shader_triangles(width, height);
     determine_triangle_winding_order(pixels, width, height,
                                      &pgraph_gl_gpu_properties);
