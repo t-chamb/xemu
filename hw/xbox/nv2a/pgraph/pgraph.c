@@ -403,6 +403,31 @@ IOSurfaceRef nv2a_get_display_iosurface(void)
     PGRAPHVkState *r = pg->vk_renderer_state;
     return r ? r->display.iosurface : NULL;
 }
+
+void nv2a_set_display_interp_size(int width, int height)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+
+    if (pg->renderer->type != CONFIG_DISPLAY_RENDERER_VULKAN ||
+        !pg->vk_renderer_state) {
+        return;
+    }
+    pgraph_vk_set_display_interp_size(pg, width, height);
+}
+
+IOSurfaceRef nv2a_get_display_interp_iosurface(void)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg = &d->pgraph;
+
+    if (pg->renderer->type != CONFIG_DISPLAY_RENDERER_VULKAN) {
+        return NULL;
+    }
+
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    return r ? r->display.interp_iosurface : NULL;
+}
 #endif
 
 void nv2a_set_surface_scale_factor(unsigned int scale)

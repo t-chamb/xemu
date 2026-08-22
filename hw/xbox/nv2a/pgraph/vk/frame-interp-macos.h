@@ -51,6 +51,9 @@ void frame_interp_push_frame(IOSurfaceRef surface);
 /* Number of frames pushed since init (0 if not initialized) */
 int frame_interp_frame_count(void);
 
+/* Current interpolation dimensions; false when not initialized. */
+bool frame_interp_get_size(int *width, int *height);
+
 /* Midpoint of the two most recently pushed frames, or NULL if it has not
  * finished computing yet (never returns an older pair's midpoint — showing
  * one would step motion backwards). On success *out_fc receives the frame

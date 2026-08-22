@@ -1119,7 +1119,24 @@ static void gl_render_frame(struct xemu_console *scon)
                                 tex = g_hold_tex[g_hold_cur ^ 1];
                             }
                         }
-                        frame_interp_push_frame(display_surface);
+
+                        /* Push the GPU-downscaled companion when it
+                         * matches the interpolation size, so the ring
+                         * copy is a memcpy instead of a full-resolution
+                         * CPU scale on this thread. */
+                        IOSurfaceRef push_surface = display_surface;
+                        int iw = 0, ih = 0;
+                        if (frame_interp_get_size(&iw, &ih)) {
+                            nv2a_set_display_interp_size(iw, ih);
+                            IOSurfaceRef small =
+                                nv2a_get_display_interp_iosurface();
+                            if (small &&
+                                (int)IOSurfaceGetWidth(small) == iw &&
+                                (int)IOSurfaceGetHeight(small) == ih) {
+                                push_surface = small;
+                            }
+                        }
+                        frame_interp_push_frame(push_surface);
                     }
                     CFRelease(display_surface);
                 } else if (g_interp_initialized) {

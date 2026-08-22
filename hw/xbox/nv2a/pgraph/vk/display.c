@@ -613,6 +613,96 @@ static void destroy_current_display_image(PGRAPHState *pg)
 // FIXME: We may need to use two images. One for actually rendering display,
 // and another for GL in the correct tiling mode
 
+#if defined(__APPLE__)
+static void destroy_interp_image(PGRAPHState *pg)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    PGRAPHVkDisplayState *d = &r->display;
+
+    if (d->interp_image == VK_NULL_HANDLE) {
+        return;
+    }
+    if (d->interp_iosurface) {
+        CFRelease(d->interp_iosurface);
+        d->interp_iosurface = NULL;
+    }
+    vkDestroyImage(r->device, d->interp_image, NULL);
+    d->interp_image = VK_NULL_HANDLE;
+    vkFreeMemory(r->device, d->interp_memory, NULL);
+    d->interp_memory = VK_NULL_HANDLE;
+    d->interp_width = 0;
+    d->interp_height = 0;
+}
+
+static void create_interp_image(PGRAPHState *pg, int width, int height)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    PGRAPHVkDisplayState *d = &r->display;
+
+    destroy_interp_image(pg);
+
+    VkExportMetalObjectCreateInfoEXT export_metal_create_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+        .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_IOSURFACE_BIT_EXT,
+    };
+    VkImageCreateInfo image_create_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &export_metal_create_info,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .extent.width = width,
+        .extent.height = height,
+        .extent.depth = 1,
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VK_CHECK(vkCreateImage(r->device, &image_create_info, NULL,
+                           &d->interp_image));
+
+    VkMemoryRequirements memory_requirements;
+    vkGetImageMemoryRequirements(r->device, d->interp_image,
+                                 &memory_requirements);
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memory_requirements.size,
+        .memoryTypeIndex =
+            pgraph_vk_get_memory_type(pg, memory_requirements.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    VK_CHECK(vkAllocateMemory(r->device, &alloc_info, NULL,
+                              &d->interp_memory));
+    VK_CHECK(vkBindImageMemory(r->device, d->interp_image, d->interp_memory,
+                               0));
+
+    VkExportMetalIOSurfaceInfoEXT surface_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_IO_SURFACE_INFO_EXT,
+        .image = d->interp_image,
+    };
+    VkExportMetalObjectsInfoEXT export_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+        .pNext = &surface_info,
+    };
+    vkExportMetalObjectsEXT(r->device, &export_info);
+    assert(surface_info.ioSurface != NULL);
+    d->interp_iosurface = (IOSurfaceRef)CFRetain(surface_info.ioSurface);
+
+    d->interp_width = width;
+    d->interp_height = height;
+}
+
+void pgraph_vk_set_display_interp_size(PGRAPHState *pg, int width, int height)
+{
+    PGRAPHVkState *r = pg->vk_renderer_state;
+    r->display.interp_req_width = width;
+    r->display.interp_req_height = height;
+}
+#endif
+
 static void create_display_image(PGRAPHState *pg, int width, int height)
 {
     PGRAPHVkState *r = pg->vk_renderer_state;
@@ -1029,6 +1119,18 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
         pgraph_vk_finish(pg, VK_FINISH_REASON_PRESENTING);
     }
 
+#if defined(__APPLE__)
+    if (disp->interp_req_width != disp->interp_width ||
+        disp->interp_req_height != disp->interp_height) {
+        if (disp->interp_req_width > 0 && disp->interp_req_height > 0) {
+            create_interp_image(pg, disp->interp_req_width,
+                                disp->interp_req_height);
+        } else {
+            destroy_interp_image(pg);
+        }
+    }
+#endif
+
     pgraph_vk_upload_surface_data(d, surface, !tcg_enabled());
 
     disp->pvideo.state = get_pvideo_state(pg);
@@ -1117,14 +1219,51 @@ static void render_display(PGRAPHState *pg, SurfaceBinding *surface)
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    pgraph_vk_transition_image_layout(pg, cmd, disp->image,
 #if defined(__APPLE__)
-                                      VK_FORMAT_B8G8R8A8_UNORM,
+    // Blit into the interpolation companion while the frame is still in
+    // the command buffer: frame interpolation then reads a small surface
+    // instead of Lanczos-scaling the full-size one on the render thread.
+    if (disp->interp_image != VK_NULL_HANDLE) {
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->image, VK_FORMAT_B8G8R8A8_UNORM,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->interp_image, VK_FORMAT_B8G8R8A8_UNORM,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+        VkImageBlit blit = {
+            .srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .srcSubresource.layerCount = 1,
+            .srcOffsets[1] = { disp->width, disp->height, 1 },
+            .dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .dstSubresource.layerCount = 1,
+            .dstOffsets[1] = { disp->interp_width, disp->interp_height, 1 },
+        };
+        vkCmdBlitImage(cmd, disp->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       disp->interp_image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_LINEAR);
+
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->interp_image, VK_FORMAT_B8G8R8A8_UNORM,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->image, VK_FORMAT_B8G8R8A8_UNORM,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else {
+        pgraph_vk_transition_image_layout(
+            pg, cmd, disp->image, VK_FORMAT_B8G8R8A8_UNORM,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
 #else
+    pgraph_vk_transition_image_layout(pg, cmd, disp->image,
                                       VK_FORMAT_R8G8B8A8_UNORM,
-#endif
                                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+#endif
 
     pgraph_vk_end_debug_marker(r, cmd);
     pgraph_vk_end_single_time_commands(pg, cmd);
@@ -1201,6 +1340,10 @@ void pgraph_vk_finalize_display(PGRAPHState *pg)
     PGRAPHVkState *r = pg->vk_renderer_state;
 
     destroy_pvideo_image(pg);
+
+#if defined(__APPLE__)
+    destroy_interp_image(pg);
+#endif
 
     if (r->display.image != VK_NULL_HANDLE) {
         destroy_current_display_image(pg);
