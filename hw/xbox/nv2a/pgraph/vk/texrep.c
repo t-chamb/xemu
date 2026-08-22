@@ -27,6 +27,10 @@
 #include "ui/thirdparty/stb_image/stb_image.h"
 #include "util/miniz/miniz.h"
 
+#if defined(__APPLE__)
+#include "texrep-ane-macos.h"
+#endif
+
 /* Keep the packed mip chain comfortably inside the 64MB staging buffer. */
 #define TEXREP_MAX_REPLACEMENT_DIM 2048
 
@@ -36,6 +40,11 @@ static struct {
     char *replace_dir;
     GHashTable *cache;      /* hash -> TexRepImage* (NULL = known absent) */
     GHashTable *dynamic;    /* vram_offset -> present */
+    GHashTable *enqueued;   /* hash -> present; offered to the ANE worker */
+    /* Hashes whose replacement PNG the ANE worker finished writing;
+     * produced on the worker thread, consumed on the render thread. */
+    GHashTable *ready;
+    GMutex ready_lock;
     int num_replaced;
     int num_dumped;
 } g_texrep;
@@ -46,6 +55,9 @@ static char *hash_path(const char *dir, uint64_t hash)
     snprintf(name, sizeof(name), "%016" PRIx64 ".png", hash);
     return g_build_filename(dir, name, NULL);
 }
+
+static void convert_to_rgba(TexRepDumpFormat fmt, const void *src, int count,
+                            uint8_t *dst);
 
 static char *hash_face_path(const char *dir, uint64_t hash, int face)
 {
@@ -70,6 +82,8 @@ void texrep_init(void)
 
     g_texrep.cache = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_texrep.dynamic = g_hash_table_new(g_int64_hash, g_int64_equal);
+    g_texrep.enqueued = g_hash_table_new(g_int64_hash, g_int64_equal);
+    g_texrep.ready = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_texrep.initialized = true;
 }
 
@@ -93,10 +107,17 @@ void texrep_finalize(void)
     if (!g_texrep.initialized) {
         return;
     }
+#if defined(__APPLE__)
+    texrep_ane_finalize();
+#endif
     g_hash_table_foreach(g_texrep.cache, free_cache_entry, NULL);
     g_hash_table_destroy(g_texrep.cache);
     g_hash_table_foreach(g_texrep.dynamic, free_dynamic_entry, NULL);
     g_hash_table_destroy(g_texrep.dynamic);
+    g_hash_table_foreach(g_texrep.enqueued, free_dynamic_entry, NULL);
+    g_hash_table_destroy(g_texrep.enqueued);
+    g_hash_table_foreach(g_texrep.ready, free_dynamic_entry, NULL);
+    g_hash_table_destroy(g_texrep.ready);
     g_free(g_texrep.dump_dir);
     g_free(g_texrep.replace_dir);
     memset(&g_texrep, 0, sizeof(g_texrep));
@@ -126,6 +147,90 @@ bool texrep_is_dynamic(uint64_t vram_offset)
 {
     return g_texrep.initialized &&
            g_hash_table_contains(g_texrep.dynamic, &vram_offset);
+}
+
+/* Worker thread: a freshly-written replacement is on disk for this hash. */
+void texrep_ane_mark_ready(uint64_t content_hash)
+{
+    g_mutex_lock(&g_texrep.ready_lock);
+    if (g_texrep.ready &&
+        !g_hash_table_contains(g_texrep.ready, &content_hash)) {
+        g_hash_table_add(g_texrep.ready,
+                         g_memdup2(&content_hash, sizeof(content_hash)));
+    }
+    g_mutex_unlock(&g_texrep.ready_lock);
+}
+
+/* Render thread: consume a ready notification. On true, the negative
+ * cache entry for the hash is dropped so the next lookup reloads from
+ * disk. */
+bool texrep_take_ready(uint64_t content_hash)
+{
+    if (!g_texrep.initialized) {
+        return false;
+    }
+    g_mutex_lock(&g_texrep.ready_lock);
+    uint64_t *key = NULL;
+    bool ready = g_hash_table_lookup_extended(g_texrep.ready, &content_hash,
+                                              (gpointer *)&key, NULL);
+    if (ready) {
+        g_hash_table_remove(g_texrep.ready, &content_hash);
+        g_free(key);
+    }
+    g_mutex_unlock(&g_texrep.ready_lock);
+
+    if (ready) {
+        uint64_t cache_key = content_hash << 1;
+        gpointer orig_key = NULL, value = NULL;
+        if (g_hash_table_lookup_extended(g_texrep.cache, &cache_key,
+                                         &orig_key, &value) &&
+            value == NULL) {
+            g_hash_table_remove(g_texrep.cache, &cache_key);
+            g_free(orig_key);
+        }
+    }
+    return ready;
+}
+
+/* Offer a texture to the background ANE upscaler; a no-op off macOS,
+ * when disabled, when a replacement already exists, or when the source
+ * exceeds the scaler's useful input size. Called from the guest upload
+ * path with native-format level-0 data. */
+void texrep_auto_upscale(uint64_t content_hash, TexRepDumpFormat fmt,
+                         int width, int height, const void *level0_data,
+                         bool force_opaque)
+{
+#if defined(__APPLE__)
+    if (!g_texrep.initialized || !g_config.display.texture_pipeline.replace ||
+        !g_config.display.texture_pipeline.auto_upscale ||
+        width <= 0 || height <= 0 || width > 512 || height > 512 ||
+        g_hash_table_contains(g_texrep.enqueued, &content_hash) ||
+        !texrep_ane_available()) {
+        return;
+    }
+    g_hash_table_add(g_texrep.enqueued,
+                     g_memdup2(&content_hash, sizeof(content_hash)));
+
+    char *path = hash_path(g_texrep.replace_dir, content_hash);
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        g_free(path);
+        return;
+    }
+    if (g_mkdir_with_parents(g_texrep.replace_dir, 0755) != 0) {
+        g_free(path);
+        return;
+    }
+
+    uint8_t *rgba = g_malloc((size_t)width * height * 4);
+    convert_to_rgba(fmt, level0_data, width * height, rgba);
+    if (force_opaque) {
+        for (size_t i = 3; i < (size_t)width * height * 4; i += 4) {
+            rgba[i] = 255;
+        }
+    }
+    texrep_ane_submit(content_hash, rgba, width, height, path); /* owns rgba */
+    g_free(path);
+#endif
 }
 
 /* Box-filter one RGBA8 mip level into the next (floor dimension halving,
