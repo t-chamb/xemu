@@ -1374,6 +1374,33 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         binding_found = false;
     }
 
+    if (binding_found && !surface_to_texture &&
+        !(possibly_dirty && content_hash != snode->hash) &&
+        !r->in_command_buffer && snode->hash != 0 &&
+        snode->texrep_gen != texrep_config_generation()) {
+        // The replacement toggles changed; re-resolve so flipping the AI
+        // upscaling setting applies to already-visible textures without a
+        // restart or manual cache clearing.
+        snode->texrep_gen = texrep_config_generation();
+        const TexRepImage *desired = NULL;
+        TexRepOrder order;
+        VkColorFormatInfo cur_vkf =
+            kelvin_color_format_vk_map[state.color_format];
+        if (state.dimensionality == 2 &&
+            !texrep_is_dynamic(texture_vram_offset) &&
+            texrep_replaceable_format(cur_vkf.vk_format, &order)) {
+            desired = state.cubemap ?
+                          texrep_lookup_cube(snode->hash, order) :
+                          texrep_lookup(snode->hash, order);
+        }
+        if (desired != snode->replacement) {
+            content_hash = snode->hash;
+            texture_cache_release_node_resources(r, snode);
+            snode->replacement = NULL;
+            binding_found = false;
+        }
+    }
+
     if (binding_found && snode->replacement &&
         (surface_to_texture ||
          (possibly_dirty && content_hash != snode->hash))) {
@@ -1420,6 +1447,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     snode->possibly_dirty = false;
     snode->hash = content_hash;
     snode->replacement = NULL;
+    snode->texrep_gen = texrep_config_generation();
 
     VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
 
