@@ -27,7 +27,10 @@
 
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VTFrameProcessor.h>
+#if __has_include(<VideoToolbox/VTFrameProcessor_SuperResolutionScaler.h>)
 #import <VideoToolbox/VTFrameProcessor_SuperResolutionScaler.h>
+#define HAVE_VT_SUPER_RESOLUTION 1
+#endif
 #import <CoreVideo/CoreVideo.h>
 #import <Accelerate/Accelerate.h>
 #include <stdatomic.h>
@@ -36,6 +39,30 @@
 #include "util/miniz/miniz.h"
 
 #include "texrep-ane-macos.h"
+
+#if !defined(HAVE_VT_SUPER_RESOLUTION)
+/* SDK too old for VTSuperResolutionScaler (macOS 26+): compile stubs so
+ * the feature reports unavailable instead of breaking the build. */
+bool texrep_ane_available(void)
+{
+    return false;
+}
+
+bool texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
+                       int height, const char *png_path)
+{
+    (void)content_hash;
+    (void)width;
+    (void)height;
+    (void)png_path;
+    g_free(rgba);
+    return false;
+}
+
+void texrep_ane_finalize(void)
+{
+}
+#else
 
 #define ANE_SCALE 4
 #define ANE_MAX_PENDING 64
@@ -55,6 +82,7 @@ static struct {
     dispatch_queue_t queue;
     NSMutableDictionary *sessions; /* "WxH" -> VTFrameProcessor */
     atomic_int pending;
+    atomic_bool shutting_down;
     int done;
 } g_ane;
 
@@ -189,6 +217,9 @@ static void process_job(AneJob *job)
 
     VTFrameProcessor *proc = session_for_size(w, h);
     if (!proc) {
+        /* Model still downloading or session setup failed — retryable:
+         * unmark so a later upload re-offers the texture. */
+        texrep_ane_mark_dropped(job->hash);
         return;
     }
 
@@ -197,6 +228,7 @@ static void process_job(AneJob *job)
     if (!src || !dst) {
         if (src) CVPixelBufferRelease(src);
         if (dst) CVPixelBufferRelease(dst);
+        texrep_ane_mark_dropped(job->hash);
         return;
     }
     fill_input(src, job->rgba, w, h);
@@ -278,13 +310,13 @@ static void process_job(AneJob *job)
     CVPixelBufferRelease(dst);
 }
 
-void texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
+bool texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
                        int height, const char *png_path)
 {
-    if (!texrep_ane_available() ||
+    if (!texrep_ane_available() || atomic_load(&g_ane.shutting_down) ||
         atomic_load(&g_ane.pending) >= ANE_MAX_PENDING) {
         g_free(rgba);
-        return;
+        return false;
     }
 
     if (!g_ane.queue) {
@@ -304,7 +336,10 @@ void texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
     atomic_fetch_add(&g_ane.pending, 1);
     dispatch_async(g_ane.queue, ^{
         @autoreleasepool {
-            if (@available(macOS 26.0, *)) {
+            if (atomic_load(&g_ane.shutting_down)) {
+                /* Abandoned at shutdown; no re-offer will come, and the
+                 * next session's fresh enqueued table re-offers anyway. */
+            } else if (@available(macOS 26.0, *)) {
                 process_job(job);
             }
         }
@@ -313,10 +348,15 @@ void texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
         g_free(job);
         atomic_fetch_sub(&g_ane.pending, 1);
     });
+    return true;
 }
 
 void texrep_ane_finalize(void)
 {
+    /* Skip everything still queued — each job is a full ANE pass and a
+     * saturated queue would freeze shutdown for tens of seconds. The
+     * dispatch_sync then only waits out the single in-flight job. */
+    atomic_store(&g_ane.shutting_down, true);
     if (g_ane.queue) {
         dispatch_sync(g_ane.queue, ^{});
         dispatch_release(g_ane.queue);
@@ -329,4 +369,7 @@ void texrep_ane_finalize(void)
     }
     [g_ane.sessions release];
     g_ane.sessions = nil;
+    atomic_store(&g_ane.shutting_down, false);
 }
+
+#endif /* HAVE_VT_SUPER_RESOLUTION */
