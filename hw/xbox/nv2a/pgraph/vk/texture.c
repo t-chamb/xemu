@@ -38,9 +38,32 @@ static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBindin
  * replacement data must be converted to. 16-bit packed formats are
  * injected as RGBA8 (identity component semantics; the canonical dump
  * already carries their alpha, including the forced-opaque X variants). */
-static bool texrep_replaceable_format(VkFormat format, TexRepOrder *order)
+/* Dump and replacement injection read/write channels in their stored
+ * order; a channel-permuting view swizzle (e.g. the SZ_B8G8R8A8 and
+ * SZ_R8G8B8A8 kelvin formats, which map to VK_FORMAT_R8G8B8A8_UNORM with
+ * permuted components) would scramble dumps and sample replacements
+ * through the same permutation. Alpha forced to ONE is fine — the dump
+ * path handles it via force_opaque. */
+static bool texrep_identity_swizzle(VkComponentMapping m)
 {
-    switch (format) {
+    return (m.r == VK_COMPONENT_SWIZZLE_IDENTITY ||
+            m.r == VK_COMPONENT_SWIZZLE_R) &&
+           (m.g == VK_COMPONENT_SWIZZLE_IDENTITY ||
+            m.g == VK_COMPONENT_SWIZZLE_G) &&
+           (m.b == VK_COMPONENT_SWIZZLE_IDENTITY ||
+            m.b == VK_COMPONENT_SWIZZLE_B) &&
+           (m.a == VK_COMPONENT_SWIZZLE_IDENTITY ||
+            m.a == VK_COMPONENT_SWIZZLE_A ||
+            m.a == VK_COMPONENT_SWIZZLE_ONE);
+}
+
+static bool texrep_replaceable_format(VkColorFormatInfo vkf,
+                                      TexRepOrder *order)
+{
+    if (!texrep_identity_swizzle(vkf.component_map)) {
+        return false;
+    }
+    switch (vkf.vk_format) {
     case VK_FORMAT_R8G8B8A8_UNORM:
         *order = TEXREP_ORDER_RGBA8;
         return true;
@@ -70,9 +93,13 @@ static VkFormat texrep_replacement_vk_format(VkFormat format)
     }
 }
 
-static bool texrep_dump_format_for(VkFormat format, TexRepDumpFormat *out)
+static bool texrep_dump_format_for(VkColorFormatInfo vkf,
+                                   TexRepDumpFormat *out)
 {
-    switch (format) {
+    if (!texrep_identity_swizzle(vkf.component_map)) {
+        return false;
+    }
+    switch (vkf.vk_format) {
     case VK_FORMAT_R8G8B8A8_UNORM:
         *out = TEXREP_DUMP_RGBA8;
         return true;
@@ -638,7 +665,7 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
     if (state->dimensionality == 2 &&
         !texrep_is_dynamic(binding->key.texture_vram_offset)) {
         TexRepDumpFormat dump_fmt;
-        if (texrep_dump_format_for(vkf.vk_format, &dump_fmt)) {
+        if (texrep_dump_format_for(vkf, &dump_fmt)) {
             bool force_opaque =
                 vkf.component_map.a == VK_COMPONENT_SWIZZLE_ONE;
             if (texrep_dump_enabled()) {
@@ -1360,6 +1387,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         if (is_indexed) {
             content_hash ^= fast_hash(palette_data, texture_palette_data_size);
         }
+        /* The content address also keys the on-disk dump/replacement
+         * store, where byte-identical payloads interpreted under a
+         * different format or geometry must not share one file. */
+        uint64_t shape = ((uint64_t)state.color_format << 40) |
+                         ((uint64_t)(state.width & 0xffff) << 24) |
+                         ((uint64_t)(state.height & 0xffff) << 8) |
+                         (uint64_t)(state.levels & 0xff);
+        content_hash ^= fast_hash((const uint8_t *)&shape, sizeof(shape));
     }
 
     if (binding_found && !snode->replacement && !surface_to_texture &&
@@ -1376,7 +1411,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
 
     if (binding_found && !surface_to_texture &&
         !(possibly_dirty && content_hash != snode->hash) &&
-        !r->in_command_buffer && snode->hash != 0 &&
+        snode->hash != 0 &&
         snode->texrep_gen != texrep_config_generation()) {
         // The replacement toggles changed; re-resolve so flipping the AI
         // upscaling setting applies to already-visible textures without a
@@ -1388,12 +1423,19 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             kelvin_color_format_vk_map[state.color_format];
         if (state.dimensionality == 2 &&
             !texrep_is_dynamic(texture_vram_offset) &&
-            texrep_replaceable_format(cur_vkf.vk_format, &order)) {
+            texrep_replaceable_format(cur_vkf, &order)) {
             desired = state.cubemap ?
                           texrep_lookup_cube(snode->hash, order) :
                           texrep_lookup(snode->hash, order);
         }
         if (desired != snode->replacement) {
+            // Deterministic even mid-recording: earlier draws in the
+            // open command buffer may reference this image, so finish
+            // outstanding work before releasing it (same hazard the
+            // dirty-replacement path below guards against).
+            if (r->in_command_buffer) {
+                pgraph_vk_finish(pg, VK_FINISH_REASON_TEXTURE_REPLACEMENT);
+            }
             content_hash = snode->hash;
             texture_cache_release_node_resources(r, snode);
             snode->replacement = NULL;
@@ -1455,7 +1497,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     if (!surface_to_texture && content_hash != 0 &&
         state.dimensionality == 2 &&
         !texrep_is_dynamic(texture_vram_offset) &&
-        texrep_replaceable_format(vkf.vk_format, &replace_order)) {
+        texrep_replaceable_format(vkf, &replace_order)) {
         snode->replacement =
             state.cubemap ? texrep_lookup_cube(content_hash, replace_order) :
                             texrep_lookup(content_hash, replace_order);
@@ -1666,6 +1708,17 @@ static bool check_textures_dirty(PGRAPHState *pg)
 
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
         if (!r->texture_bindings[i] || pg->texture_dirty[i]) {
+            return true;
+        }
+    }
+
+    /* A replacement-toggle flip must reach bindings even when no slot is
+     * otherwise dirty, or the setting only applies to textures that
+     * happen to churn. */
+    uint32_t gen = texrep_config_generation();
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        if (r->texture_bindings[i]->hash != 0 &&
+            r->texture_bindings[i]->texrep_gen != gen) {
             return true;
         }
     }

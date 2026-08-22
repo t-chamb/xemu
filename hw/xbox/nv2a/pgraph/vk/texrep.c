@@ -54,6 +54,10 @@ static struct {
     /* Hashes whose replacement PNG the ANE worker finished writing;
      * produced on the worker thread, consumed on the render thread. */
     GHashTable *ready;
+    /* Hashes the worker abandoned for a retryable reason (model still
+     * downloading, allocation failure); drained on the render thread so
+     * the texture becomes eligible for re-offer. Shares ready_lock. */
+    GHashTable *dropped;
     GMutex ready_lock;
     int num_replaced;
     int num_dumped;
@@ -97,6 +101,7 @@ void texrep_init(void)
     g_texrep.dynamic = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_texrep.enqueued = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_texrep.ready = g_hash_table_new(g_int64_hash, g_int64_equal);
+    g_texrep.dropped = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_texrep.initialized = true;
 }
 
@@ -131,6 +136,8 @@ void texrep_finalize(void)
     g_hash_table_destroy(g_texrep.enqueued);
     g_hash_table_foreach(g_texrep.ready, free_dynamic_entry, NULL);
     g_hash_table_destroy(g_texrep.ready);
+    g_hash_table_foreach(g_texrep.dropped, free_dynamic_entry, NULL);
+    g_hash_table_destroy(g_texrep.dropped);
     g_free(g_texrep.dump_dir);
     g_free(g_texrep.replace_dir);
     g_free(g_texrep.auto_dir);
@@ -176,6 +183,18 @@ bool texrep_is_dynamic(uint64_t vram_offset)
 {
     return g_texrep.initialized &&
            g_hash_table_contains(g_texrep.dynamic, &vram_offset);
+}
+
+/* Worker thread: a job was abandoned for a retryable reason. */
+void texrep_ane_mark_dropped(uint64_t content_hash)
+{
+    g_mutex_lock(&g_texrep.ready_lock);
+    if (g_texrep.dropped &&
+        !g_hash_table_contains(g_texrep.dropped, &content_hash)) {
+        g_hash_table_add(g_texrep.dropped,
+                         g_memdup2(&content_hash, sizeof(content_hash)));
+    }
+    g_mutex_unlock(&g_texrep.ready_lock);
 }
 
 /* Worker thread: a freshly-written replacement is on disk for this hash. */
@@ -234,15 +253,40 @@ void texrep_auto_upscale(uint64_t content_hash, TexRepDumpFormat fmt,
     if (!g_texrep.initialized || !g_config.display.texture_pipeline.replace ||
         !g_config.display.texture_pipeline.auto_upscale ||
         width <= 0 || height <= 0 || width > 512 || height > 512 ||
-        g_hash_table_contains(g_texrep.enqueued, &content_hash) ||
         !texrep_ane_available()) {
         return;
     }
-    g_hash_table_add(g_texrep.enqueued,
-                     g_memdup2(&content_hash, sizeof(content_hash)));
+
+    /* Re-arm anything the worker abandoned for a retryable reason. */
+    g_mutex_lock(&g_texrep.ready_lock);
+    uint64_t *dkey = NULL;
+    bool was_dropped =
+        g_hash_table_lookup_extended(g_texrep.dropped, &content_hash,
+                                     (gpointer *)&dkey, NULL);
+    if (was_dropped) {
+        g_hash_table_remove(g_texrep.dropped, &content_hash);
+        g_free(dkey);
+    }
+    g_mutex_unlock(&g_texrep.ready_lock);
+    if (was_dropped) {
+        uint64_t *ekey = NULL;
+        if (g_hash_table_lookup_extended(g_texrep.enqueued, &content_hash,
+                                         (gpointer *)&ekey, NULL)) {
+            g_hash_table_remove(g_texrep.enqueued, &content_hash);
+            g_free(ekey);
+        }
+    }
+
+    if (g_hash_table_contains(g_texrep.enqueued, &content_hash)) {
+        return;
+    }
 
     char *path = hash_path(g_texrep.auto_dir, content_hash);
     if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        /* Result already on disk: remember so we stop probing the
+         * filesystem on every upload. */
+        g_hash_table_add(g_texrep.enqueued,
+                         g_memdup2(&content_hash, sizeof(content_hash)));
         g_free(path);
         return;
     }
@@ -258,7 +302,13 @@ void texrep_auto_upscale(uint64_t content_hash, TexRepDumpFormat fmt,
             rgba[i] = 255;
         }
     }
-    texrep_ane_submit(content_hash, rgba, width, height, path); /* owns rgba */
+    /* Mark enqueued only when the worker actually accepted the job — a
+     * saturated queue must leave the texture eligible for re-offer. */
+    if (texrep_ane_submit(content_hash, rgba, width, height,
+                          path) /* owns rgba */) {
+        g_hash_table_add(g_texrep.enqueued,
+                         g_memdup2(&content_hash, sizeof(content_hash)));
+    }
     g_free(path);
 #endif
 }

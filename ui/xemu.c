@@ -849,6 +849,9 @@ static void interp_display_reset(void)
     g_last_surface_id = 0;
     g_last_surface_width = 0;
     g_last_surface_height = 0;
+    /* Release the GPU downscale companion; without this the renderer
+     * keeps blitting into it every displayed frame forever. */
+    nv2a_set_display_interp_size(0, 0);
     if (g_interp_gl_tex) {
         glDeleteTextures(1, &g_interp_gl_tex);
         glDeleteTextures(1, &g_interp_rect_tex);
