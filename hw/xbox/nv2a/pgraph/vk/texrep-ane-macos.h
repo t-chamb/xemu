@@ -37,19 +37,27 @@ extern "C" {
 bool texrep_ane_available(void);
 
 /* Queue one texture for background upscaling. Takes ownership of rgba
- * (g_malloc'd, width*height*4, straight-alpha canonical RGBA). png_path
- * is copied. Silently drops work when the queue is saturated; the
- * texture will be re-offered on a later upload. On success the worker
- * writes png_path and calls texrep_ane_mark_ready(content_hash). */
-void texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
+ * (g_malloc'd, width*height*4, straight-alpha canonical RGBA) on both
+ * outcomes. png_path is copied. Returns false when the job is rejected
+ * (queue saturated) so the caller can leave the texture eligible for a
+ * later re-offer. On success the worker writes png_path and calls
+ * texrep_ane_mark_ready(content_hash); retryable worker-side failures
+ * (model still downloading, allocation) call texrep_ane_mark_dropped
+ * instead. */
+bool texrep_ane_submit(uint64_t content_hash, uint8_t *rgba, int width,
                        int height, const char *png_path);
 
-/* Drain the queue and release scaler sessions. */
+/* Abandon queued jobs, wait for the in-flight one, release sessions. */
 void texrep_ane_finalize(void);
 
 /* Implemented by texrep.c: called from the worker thread when a
  * replacement PNG has been written and verified. */
 void texrep_ane_mark_ready(uint64_t content_hash);
+
+/* Implemented by texrep.c: called from the worker thread when a job was
+ * abandoned for a retryable reason; the texture becomes eligible for
+ * re-offer on a later upload. */
+void texrep_ane_mark_dropped(uint64_t content_hash);
 
 #ifdef __cplusplus
 }
