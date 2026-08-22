@@ -138,6 +138,11 @@ static struct {
 
 static void do_vt_processing(int head, int fc);
 
+/* Dimensions of the most recent init attempt, so a failed adaptive
+ * re-init (which tears the session down) can be retried instead of
+ * leaving interpolation silently dead with the hold latency applied. */
+static int g_last_init_w, g_last_init_h;
+
 /* VT queue thread: record inference wall time. */
 static void adapt_note_sample(double ms)
 {
@@ -229,6 +234,8 @@ bool frame_interp_init(int width, int height)
     // MRC: pool for the autoreleased literals created below; the render
     // thread calling this has no pool of its own.
     @autoreleasepool {
+    g_last_init_w = width;
+    g_last_init_h = height;
     if (g_interp.initialized) {
         frame_interp_finalize();
     }
@@ -529,8 +536,22 @@ void frame_interp_set_quality_cap(int max_dim)
 
 void frame_interp_push_frame(IOSurfaceRef surface)
 {
-    if (!g_interp.initialized || !surface) {
+    if (!surface) {
         return;
+    }
+    if (!g_interp.initialized) {
+        if (g_last_init_w <= 0) {
+            return;
+        }
+        static uint64_t last_retry_ns;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now - last_retry_ns < 1000000000ull) {
+            return;
+        }
+        last_retry_ns = now;
+        if (!frame_interp_init(g_last_init_w, g_last_init_h)) {
+            return;
+        }
     }
 
     // Re-init the session when the adaptive target (perf rung, display
