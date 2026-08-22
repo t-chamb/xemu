@@ -34,6 +34,42 @@
 
 static void texture_cache_release_node_resources(PGRAPHVkState *r, TextureBinding *snode);
 
+/* Formats eligible for replacement injection, with the channel order the
+ * replacement data must be converted to. 16-bit packed formats are
+ * injected as RGBA8 (identity component semantics; the canonical dump
+ * already carries their alpha, including the forced-opaque X variants). */
+static bool texrep_replaceable_format(VkFormat format, TexRepOrder *order)
+{
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        *order = TEXREP_ORDER_RGBA8;
+        return true;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        *order = TEXREP_ORDER_BGRA8;
+        return true;
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+        *order = TEXREP_ORDER_RGBA8;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The VkFormat a replacement image is created and uploaded with. */
+static VkFormat texrep_replacement_vk_format(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    default:
+        return format;
+    }
+}
+
 static bool texrep_dump_format_for(VkFormat format, TexRepDumpFormat *out)
 {
     switch (format) {
@@ -510,6 +546,7 @@ static void upload_replacement_image(PGRAPHState *pg, TextureBinding *binding)
     const TexRepImage *rep = binding->replacement;
     VkColorFormatInfo vkf =
         kelvin_color_format_vk_map[binding->key.state.color_format];
+    vkf.vk_format = texrep_replacement_vk_format(vkf.vk_format);
 
     nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
 
@@ -522,17 +559,22 @@ static void upload_replacement_image(PGRAPHState *pg, TextureBinding *binding)
                           (void *)&mapped_memory_ptr));
     memcpy(mapped_memory_ptr, rep->data, rep->data_size);
 
+    int num_regions = rep->faces * rep->levels;
     g_autofree VkBufferImageCopy *regions =
-        g_malloc0_n(rep->levels, sizeof(VkBufferImageCopy));
-    for (int level = 0; level < rep->levels; level++) {
-        regions[level] = (VkBufferImageCopy){
-            .bufferOffset = rep->level_offset[level],
-            .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .imageSubresource.mipLevel = level,
-            .imageSubresource.layerCount = 1,
-            .imageExtent = (VkExtent3D){ rep->level_width[level],
-                                         rep->level_height[level], 1 },
-        };
+        g_malloc0_n(num_regions, sizeof(VkBufferImageCopy));
+    for (int face = 0; face < rep->faces; face++) {
+        for (int level = 0; level < rep->levels; level++) {
+            regions[face * rep->levels + level] = (VkBufferImageCopy){
+                .bufferOffset =
+                    face * rep->face_stride + rep->level_offset[level],
+                .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .imageSubresource.mipLevel = level,
+                .imageSubresource.baseArrayLayer = face,
+                .imageSubresource.layerCount = 1,
+                .imageExtent = (VkExtent3D){ rep->level_width[level],
+                                             rep->level_height[level], 1 },
+            };
+        }
     }
 
     vmaFlushAllocation(r->allocator,
@@ -564,7 +606,7 @@ static void upload_replacement_image(PGRAPHState *pg, TextureBinding *binding)
 
     vkCmdCopyBufferToImage(cmd, r->storage_buffers[BUFFER_STAGING_SRC].buffer,
                            binding->image, binding->current_layout,
-                           rep->levels, regions);
+                           num_regions, regions);
 
     pgraph_vk_transition_image_layout(pg, cmd, binding->image, vkf.vk_format,
                                       binding->current_layout,
@@ -594,16 +636,21 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
     const int num_layers = state->cubemap ? 6 : 1;
 
     if (texrep_dump_enabled() && state->dimensionality == 2 &&
-        !state->cubemap &&
         !texrep_is_dynamic(binding->key.texture_vram_offset)) {
-        TextureLevel *level0 = &layout->layers[0].levels[0];
         TexRepDumpFormat dump_fmt;
-        if (level0->depth == 1 &&
-            texrep_dump_format_for(vkf.vk_format, &dump_fmt)) {
+        if (texrep_dump_format_for(vkf.vk_format, &dump_fmt)) {
             bool force_opaque =
                 vkf.component_map.a == VK_COMPONENT_SWIZZLE_ONE;
-            texrep_dump(binding->hash, dump_fmt, level0->width,
-                        level0->height, level0->decoded_data, force_opaque);
+            for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
+                TextureLevel *level0 = &layout->layers[layer_idx].levels[0];
+                if (level0->depth != 1) {
+                    continue;
+                }
+                texrep_dump(binding->hash, dump_fmt, level0->width,
+                            level0->height, level0->decoded_data,
+                            force_opaque,
+                            state->cubemap ? layer_idx : -1);
+            }
         }
     }
 
@@ -1303,6 +1350,27 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         }
     }
 
+    if (binding_found && snode->replacement &&
+        (surface_to_texture ||
+         (possibly_dirty && content_hash != snode->hash))) {
+        // The image was created at replacement dimensions (and possibly a
+        // retargeted format), so neither the surface-aliasing copy nor an
+        // in-place guest re-upload may touch it: release it and fall
+        // through to recreate a guest-shaped image. The still-recording
+        // command buffer can reference this image from earlier draws
+        // (the same hazard texture_cache_entry_pre_evict guards against),
+        // so finish outstanding work before destroying it.
+        if (!surface_to_texture) {
+            // In-place guest updates mean this texture is dynamic;
+            // exclude it from replacement for the session.
+            texrep_mark_dynamic(texture_vram_offset);
+        }
+        pgraph_vk_finish(pg, VK_FINISH_REASON_TEXTURE_REPLACEMENT);
+        texture_cache_release_node_resources(r, snode);
+        snode->replacement = NULL;
+        binding_found = false;
+    }
+
     if (binding_found) {
         if (surface_to_texture) {
             // FIXME: Add draw time tracking
@@ -1311,26 +1379,14 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             }
         } else {
             if (possibly_dirty && content_hash != snode->hash) {
-                // In-place guest updates mean this texture is dynamic;
-                // exclude it from replacement for the session.
                 texrep_mark_dynamic(texture_vram_offset);
-                if (snode->replacement) {
-                    // The image is sized for the replacement; release it
-                    // and fall through to recreate at guest dimensions.
-                    texture_cache_release_node_resources(r, snode);
-                    snode->replacement = NULL;
-                    binding_found = false;
-                } else {
-                    snode->hash = content_hash;
-                    upload_texture_image(pg, texture_idx, snode);
-                }
+                snode->hash = content_hash;
+                upload_texture_image(pg, texture_idx, snode);
             }
         }
 
-        if (binding_found) {
-            NV2A_VK_DGROUP_END();
-            return;
-        }
+        NV2A_VK_DGROUP_END();
+        return;
     }
 
     NV2A_VK_DPRINTF("Cache miss");
@@ -1343,16 +1399,20 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
 
     VkColorFormatInfo vkf = kelvin_color_format_vk_map[state.color_format];
 
+    TexRepOrder replace_order;
     if (!surface_to_texture && content_hash != 0 &&
-        state.dimensionality == 2 && !state.cubemap &&
+        state.dimensionality == 2 &&
         !texrep_is_dynamic(texture_vram_offset) &&
-        (vkf.vk_format == VK_FORMAT_R8G8B8A8_UNORM ||
-         vkf.vk_format == VK_FORMAT_B8G8R8A8_UNORM)) {
+        texrep_replaceable_format(vkf.vk_format, &replace_order)) {
         snode->replacement =
-            texrep_lookup(content_hash,
-                          vkf.vk_format == VK_FORMAT_B8G8R8A8_UNORM ?
-                              TEXREP_ORDER_BGRA8 :
-                              TEXREP_ORDER_RGBA8);
+            state.cubemap ? texrep_lookup_cube(content_hash, replace_order) :
+                            texrep_lookup(content_hash, replace_order);
+        if (snode->replacement) {
+            /* Component swizzles are identity (plus any forced-opaque
+             * alpha) for every replaceable format, so retargeting the
+             * image format preserves sampling semantics. */
+            vkf.vk_format = texrep_replacement_vk_format(vkf.vk_format);
+        }
     }
     assert(vkf.vk_format != 0);
     assert(0 < state.dimensionality);

@@ -26,6 +26,8 @@ import ImageIO
 import UniformTypeIdentifiers
 
 let SCALE = 4
+/* VTSuperResolutionScaler image-input limit (macOS). */
+let INPUT_CAP = 1920
 
 var maxDim = 2048
 var force = false
@@ -37,7 +39,11 @@ while !args.isEmpty {
     let a = args.removeFirst()
     switch a {
     case "--max-dim":
-        maxDim = Int(args.removeFirst()) ?? 2048
+        guard !args.isEmpty, let v = Int(args.removeFirst()) else {
+            FileHandle.standardError.write("--max-dim requires a numeric value\n".data(using: .utf8)!)
+            exit(2)
+        }
+        maxDim = v
     case "--force":
         force = true
     case "--self-test":
@@ -50,6 +56,9 @@ while !args.isEmpty {
 if selfTest {
     texturesDir = NSTemporaryDirectory() + "/texrep-selftest"
     force = true
+    /* Below the fixtures' 4x output size so the downsample stage runs and
+     * its output passes through verification too. */
+    maxDim = 256
 }
 
 guard let root = texturesDir else {
@@ -419,10 +428,10 @@ for name in entries {
         continue
     }
     let w = image.width, h = image.height
-    /* The scaler only does 4x and image inputs cap at 1920; anything whose
-     * 4x result exceeds maxDim gets downsampled after upscaling — a 1024
-     * source still comes out 2x sharper at the 2048 cap. */
-    if w > 1920 || h > 1920 {
+    /* The scaler only does 4x and image inputs cap at INPUT_CAP; anything
+     * whose 4x result exceeds maxDim gets downsampled after upscaling — a
+     * 1024 source still comes out 2x sharper at the 2048 cap. */
+    if w > INPUT_CAP || h > INPUT_CAP {
         skippedBig += 1
         continue
     }
@@ -501,8 +510,8 @@ for name in entries {
 
 let dt = Date().timeIntervalSince(start)
 print(String(format: "done: %d upscaled in %.1fs, %d already present, " +
-             "%d too large (>%d), %d failed, %d rejected by verification",
-             done, dt, skippedExisting, skippedBig, maxDim, failed,
+             "%d too large (input >%d), %d failed, %d rejected by verification",
+             done, dt, skippedExisting, skippedBig, INPUT_CAP, failed,
              verifyFailed))
 
 if selfTest {
@@ -513,6 +522,6 @@ if selfTest {
     print("self-test FAIL")
     exit(1)
 }
-if verifyFailed > 0 {
+if verifyFailed > 0 || failed > 0 {
     exit(1)
 }
