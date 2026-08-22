@@ -67,7 +67,9 @@ guard let root = texturesDir else {
 }
 
 let dumpDir = root + "/dump"
-let replaceDir = root + "/replace"
+/* AI-generated outputs live in their own layer so the in-app toggle can
+ * disable them without touching hand-made packs in replace/. */
+let replaceDir = root + "/replace-auto"
 
 guard #available(macOS 26.0, *) else {
     FileHandle.standardError.write("VTSuperResolutionScaler requires macOS 26+\n".data(using: .utf8)!)

@@ -77,6 +77,10 @@ void texrep_finalize(void);
 bool texrep_replace_enabled(void);
 bool texrep_dump_enabled(void);
 
+/* Monotonic counter bumped when the replace/auto-upscale toggles change;
+ * bindings compare against it to re-evaluate their replacement live. */
+uint32_t texrep_config_generation(void);
+
 /* Returns a session-cached replacement image for the given content hash,
  * or NULL. The returned pointer stays valid until texrep_finalize(). */
 const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order);
