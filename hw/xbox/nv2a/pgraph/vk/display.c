@@ -750,7 +750,12 @@ static void create_display_image(PGRAPHState *pg, int width, int height)
 #endif
         .tiling = use_optimal_tiling ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+#if defined(__APPLE__)
+                 /* Blit source for the interpolation companion downscale */
+                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+#endif
+        ,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
