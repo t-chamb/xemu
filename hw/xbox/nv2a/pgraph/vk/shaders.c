@@ -21,6 +21,7 @@
 #include "qemu/fast-hash.h"
 #include "qemu/mstring.h"
 #include "renderer.h"
+#include "texrep.h"
 
 #define VSH_UBO_BINDING 0
 #define PSH_UBO_BINDING 1
@@ -467,14 +468,19 @@ static void update_shader_uniforms(PGRAPHState *pg)
                                        &psh_values);
     for (int i = 0; i < 4; i++) {
         assert(r->texture_bindings[i] != NULL);
-        float scale = r->texture_bindings[i]->key.scale;
+        TextureBinding *tb = r->texture_bindings[i];
+        float scale = tb->key.scale;
 
         BasicColorFormatInfo f_basic =
-            kelvin_color_format_info_map[pg->vk_renderer_state
-                                             ->texture_bindings[i]
-                                             ->key.state.color_format];
+            kelvin_color_format_info_map[tb->key.state.color_format];
         if (!f_basic.linear) {
             scale = 1.0;
+        } else if (tb->replacement && tb->key.state.width > 0) {
+            /* Rect textures normalize as coord / (textureSize / texScale);
+             * textureSize reports the replacement image, so fold the
+             * replacement ratio into texScale to keep the guest-coordinate
+             * denominator intact. */
+            scale *= (float)tb->replacement->width / tb->key.state.width;
         }
 
         psh_values.texScale[i] = scale;
