@@ -1313,6 +1313,7 @@ static void end_render_pass(PGRAPHVkState *r)
 
 const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [VK_FINISH_REASON_VERTEX_BUFFER_DIRTY] = NV2A_PROF_FINISH_VERTEX_BUFFER_DIRTY,
+    [VK_FINISH_REASON_TEXTURE_REPLACEMENT] = NV2A_PROF_FINISH_TEXTURE_REPLACEMENT,
     [VK_FINISH_REASON_SURFACE_CREATE] = NV2A_PROF_FINISH_SURFACE_CREATE,
     [VK_FINISH_REASON_SURFACE_DOWN] = NV2A_PROF_FINISH_SURFACE_DOWN,
     [VK_FINISH_REASON_NEED_BUFFER_SPACE] = NV2A_PROF_FINISH_NEED_BUFFER_SPACE,
@@ -2132,8 +2133,10 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
 }
 
 /* Without geometry shaders, quads are drawn as triangle lists with indices
- * expanded on the CPU: quad (0,1,2,3) becomes triangles (0,1,2) and (0,2,3),
- * covering the same area with the same winding as the GS expansion.
+ * expanded on the CPU: quad (0,1,2,3) becomes triangles (3,0,1) and (3,1,2)
+ * — same coverage and winding as the GS expansion, and both triangles lead
+ * with v3, which is the quad's provoking vertex on NV2A, so Vulkan's
+ * first-vertex flat-shading convention picks the correct color.
  */
 static bool needs_quad_index_expansion(PGRAPHState *pg)
 {
@@ -2156,8 +2159,8 @@ static uint32_t expand_quads_to_triangles(const uint32_t *in, uint32_t start,
         uint32_t i1 = in ? in[base + 1] : start + base + 1;
         uint32_t i2 = in ? in[base + 2] : start + base + 2;
         uint32_t i3 = in ? in[base + 3] : start + base + 3;
-        *p++ = i0; *p++ = i1; *p++ = i2;
-        *p++ = i0; *p++ = i2; *p++ = i3;
+        *p++ = i3; *p++ = i0; *p++ = i1;
+        *p++ = i3; *p++ = i1; *p++ = i2;
     }
     return p - out;
 }
@@ -2196,12 +2199,14 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         uint32_t *quad_indices = NULL;
         uint32_t num_quad_indices = 0;
-        if (needs_quad_index_expansion(pg)) {
+        bool quads_expanded = needs_quad_index_expansion(pg);
+        if (quads_expanded) {
             uint32_t total_vertices = 0;
             for (int i = 0; i < pg->draw_arrays_length; i++) {
                 total_vertices += pg->draw_arrays_count[i];
             }
-            quad_indices = g_malloc((total_vertices / 4) * 6 * sizeof(uint32_t));
+            quad_indices = g_malloc0(MAX(total_vertices / 4, 1u) * 6 *
+                                     sizeof(uint32_t));
             for (int i = 0; i < pg->draw_arrays_length; i++) {
                 num_quad_indices += expand_quads_to_triangles(
                     NULL, pg->draw_arrays_start[i], pg->draw_arrays_count[i],
@@ -2214,7 +2219,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         begin_pre_draw(pg);
         copy_remapped_attributes_to_inline_buffer(pg, remap, 0, max_element);
         VkDeviceSize quad_index_offset = 0;
-        if (quad_indices) {
+        if (quads_expanded && num_quad_indices > 0) {
             quad_index_offset = pgraph_vk_update_index_buffer(
                 pg, quad_indices, num_quad_indices * sizeof(uint32_t));
         }
@@ -2222,11 +2227,15 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Draw Arrays");
         begin_draw(pg);
         bind_vertex_buffer(pg, remap.attributes, 0);
-        if (quad_indices) {
-            vkCmdBindIndexBuffer(r->command_buffer,
-                                 r->storage_buffers[BUFFER_INDEX].buffer,
-                                 quad_index_offset, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(r->command_buffer, num_quad_indices, 1, 0, 0, 0);
+        if (quads_expanded) {
+            // num_quad_indices == 0 means no complete quad: draw nothing.
+            if (num_quad_indices > 0) {
+                vkCmdBindIndexBuffer(r->command_buffer,
+                                     r->storage_buffers[BUFFER_INDEX].buffer,
+                                     quad_index_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(r->command_buffer, num_quad_indices, 1, 0, 0,
+                                 0);
+            }
         } else {
             for (int i = 0; i < pg->draw_arrays_length; i++) {
                 uint32_t start = pg->draw_arrays_start[i],
@@ -2251,8 +2260,8 @@ void pgraph_vk_flush_draw(NV2AState *d)
         uint32_t index_count = pg->inline_elements_length;
         uint32_t *quad_indices = NULL;
         if (needs_quad_index_expansion(pg)) {
-            quad_indices =
-                g_malloc((index_count / 4) * 6 * sizeof(uint32_t));
+            quad_indices = g_malloc0(MAX(index_count / 4, 1u) * 6 *
+                                     sizeof(uint32_t));
             index_count = expand_quads_to_triangles(
                 pg->inline_elements, 0, index_count, quad_indices);
             index_data = quad_indices;
@@ -2317,9 +2326,10 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         uint32_t *quad_indices = NULL;
         uint32_t num_quad_indices = 0;
-        if (needs_quad_index_expansion(pg)) {
-            quad_indices = g_malloc((pg->inline_buffer_length / 4) * 6 *
-                                    sizeof(uint32_t));
+        bool quads_expanded = needs_quad_index_expansion(pg);
+        if (quads_expanded) {
+            quad_indices = g_malloc0(MAX(pg->inline_buffer_length / 4, 1u) *
+                                     6 * sizeof(uint32_t));
             num_quad_indices = expand_quads_to_triangles(
                 NULL, 0, pg->inline_buffer_length, quad_indices);
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
@@ -2330,7 +2340,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
             pg, data, sizes, r->num_active_vertex_attribute_descriptions);
         VkDeviceSize quad_index_offset = 0;
-        if (quad_indices) {
+        if (quads_expanded && num_quad_indices > 0) {
             quad_index_offset = pgraph_vk_update_index_buffer(
                 pg, quad_indices, num_quad_indices * sizeof(uint32_t));
         }
@@ -2338,11 +2348,14 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Buffer");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        if (quad_indices) {
-            vkCmdBindIndexBuffer(r->command_buffer,
-                                 r->storage_buffers[BUFFER_INDEX].buffer,
-                                 quad_index_offset, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(r->command_buffer, num_quad_indices, 1, 0, 0, 0);
+        if (quads_expanded) {
+            if (num_quad_indices > 0) {
+                vkCmdBindIndexBuffer(r->command_buffer,
+                                     r->storage_buffers[BUFFER_INDEX].buffer,
+                                     quad_index_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(r->command_buffer, num_quad_indices, 1, 0, 0,
+                                 0);
+            }
         } else {
             vkCmdDraw(r->command_buffer, pg->inline_buffer_length, 1, 0, 0);
         }
@@ -2384,9 +2397,10 @@ void pgraph_vk_flush_draw(NV2AState *d)
 
         uint32_t *quad_indices = NULL;
         uint32_t num_quad_indices = 0;
-        if (needs_quad_index_expansion(pg)) {
-            quad_indices =
-                g_malloc((index_count / 4) * 6 * sizeof(uint32_t));
+        bool quads_expanded = needs_quad_index_expansion(pg);
+        if (quads_expanded) {
+            quad_indices = g_malloc0(MAX(index_count / 4, 1u) * 6 *
+                                     sizeof(uint32_t));
             num_quad_indices = expand_quads_to_triangles(NULL, 0, index_count,
                                                          quad_indices);
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
@@ -2398,7 +2412,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         VkDeviceSize buffer_offset = pgraph_vk_update_vertex_inline_buffer(
             pg, &inline_array_data, &inline_array_data_size, 1);
         VkDeviceSize quad_index_offset = 0;
-        if (quad_indices) {
+        if (quads_expanded && num_quad_indices > 0) {
             quad_index_offset = pgraph_vk_update_index_buffer(
                 pg, quad_indices, num_quad_indices * sizeof(uint32_t));
         }
@@ -2406,11 +2420,14 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      "Inline Array");
         begin_draw(pg);
         bind_inline_vertex_buffer(pg, buffer_offset);
-        if (quad_indices) {
-            vkCmdBindIndexBuffer(r->command_buffer,
-                                 r->storage_buffers[BUFFER_INDEX].buffer,
-                                 quad_index_offset, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(r->command_buffer, num_quad_indices, 1, 0, 0, 0);
+        if (quads_expanded) {
+            if (num_quad_indices > 0) {
+                vkCmdBindIndexBuffer(r->command_buffer,
+                                     r->storage_buffers[BUFFER_INDEX].buffer,
+                                     quad_index_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(r->command_buffer, num_quad_indices, 1, 0, 0,
+                                 0);
+            }
         } else {
             vkCmdDraw(r->command_buffer, index_count, 1, 0, 0);
         }
