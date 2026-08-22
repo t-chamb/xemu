@@ -232,6 +232,8 @@ typedef struct TextureBinding {
     /* Non-NULL when the image holds replacement data (texrep.h); owned by
      * the texrep session cache, not this binding. */
     const struct TexRepImage *replacement;
+    /* texrep_config_generation() at last replacement evaluation. */
+    uint32_t texrep_gen;
 } TextureBinding;
 
 typedef struct QueryReport {
@@ -313,6 +315,14 @@ typedef struct PGRAPHVkDisplayState {
     unsigned int gl_texture_id;      // GL_TEXTURE_2D for UI consumption
     unsigned int gl_fbo;             // FBO for rect→2D blit (read side)
     unsigned int gl_draw_fbo;        // FBO for rect→2D blit (draw side)
+
+    // Downscaled companion image, blitted on the GPU at display time so
+    // frame interpolation never scales the full-size surface on the CPU.
+    VkImage interp_image;
+    VkDeviceMemory interp_memory;
+    IOSurfaceRef interp_iosurface;
+    int interp_width, interp_height;         // current companion size
+    int interp_req_width, interp_req_height; // requested by the UI
 #endif
 } PGRAPHVkDisplayState;
 
@@ -559,6 +569,9 @@ void pgraph_vk_unpack_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
 
 // display.c
 void pgraph_vk_init_display(PGRAPHState *pg);
+#if defined(__APPLE__)
+void pgraph_vk_set_display_interp_size(PGRAPHState *pg, int width, int height);
+#endif
 void pgraph_vk_finalize_display(PGRAPHState *pg);
 void pgraph_vk_render_display(PGRAPHState *pg);
 #if defined(__APPLE__)

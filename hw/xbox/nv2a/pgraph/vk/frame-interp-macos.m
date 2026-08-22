@@ -439,16 +439,33 @@ static void do_vt_processing(int head, int fc)
     } // @autoreleasepool
 }
 
+bool frame_interp_get_size(int *width, int *height)
+{
+    if (!g_interp.initialized) {
+        return false;
+    }
+    *width = g_interp.width;
+    *height = g_interp.height;
+    return true;
+}
+
 // Copy IOSurface data into the ring buffer slot (with optional downscale).
 // Must be called from the dispatch queue.
 static void do_push_copy(IOSurfaceRef surface, int head)
 {
     CVPixelBufferRef dst = g_interp.ring[head];
 
+    // Decide per surface: the caller may hand us a GPU-downscaled
+    // companion already at interpolation size, in which case the copy is
+    // a plain memcpy regardless of the session's source dimensions.
+    bool needs_scale =
+        (int)IOSurfaceGetWidth(surface) != g_interp.width ||
+        (int)IOSurfaceGetHeight(surface) != g_interp.height;
+
     IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
     CVPixelBufferLockBaseAddress(dst, 0);
 
-    if (g_interp.needs_scale) {
+    if (needs_scale) {
         vImage_Buffer src_buf = {
             .data = IOSurfaceGetBaseAddress(surface),
             .width = (vImagePixelCount)IOSurfaceGetWidth(surface),
