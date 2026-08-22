@@ -248,6 +248,9 @@ display:
     replace:
       type: bool
       default: true
+    auto_upscale:
+      type: bool
+      default: true
   window:
     fullscreen_on_startup: bool
     fullscreen_exclusive: bool

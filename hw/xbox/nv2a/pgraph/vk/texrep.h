@@ -102,6 +102,16 @@ void texrep_dump(uint64_t content_hash, TexRepDumpFormat fmt, int width,
                  int height, const void *level0_data, bool force_opaque,
                  int face);
 
+/* Offer a texture to the in-process ANE upscaler (macOS; no-op elsewhere
+ * or when display.texture_pipeline.auto_upscale is off). */
+void texrep_auto_upscale(uint64_t content_hash, TexRepDumpFormat fmt,
+                         int width, int height, const void *level0_data,
+                         bool force_opaque);
+
+/* Render thread: true once for a hash whose background upscale finished;
+ * also invalidates the session's negative lookup so the fresh file loads. */
+bool texrep_take_ready(uint64_t content_hash);
+
 #ifdef __cplusplus
 }
 #endif
