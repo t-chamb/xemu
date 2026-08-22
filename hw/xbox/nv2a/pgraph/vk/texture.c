@@ -635,21 +635,33 @@ static void upload_texture_image(PGRAPHState *pg, int texture_idx,
     g_autofree TextureLayout *layout = get_texture_layout(pg, texture_idx);
     const int num_layers = state->cubemap ? 6 : 1;
 
-    if (texrep_dump_enabled() && state->dimensionality == 2 &&
+    if (state->dimensionality == 2 &&
         !texrep_is_dynamic(binding->key.texture_vram_offset)) {
         TexRepDumpFormat dump_fmt;
         if (texrep_dump_format_for(vkf.vk_format, &dump_fmt)) {
             bool force_opaque =
                 vkf.component_map.a == VK_COMPONENT_SWIZZLE_ONE;
-            for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
-                TextureLevel *level0 = &layout->layers[layer_idx].levels[0];
-                if (level0->depth != 1) {
-                    continue;
+            if (texrep_dump_enabled()) {
+                for (int layer_idx = 0; layer_idx < num_layers;
+                     layer_idx++) {
+                    TextureLevel *level0 =
+                        &layout->layers[layer_idx].levels[0];
+                    if (level0->depth != 1) {
+                        continue;
+                    }
+                    texrep_dump(binding->hash, dump_fmt, level0->width,
+                                level0->height, level0->decoded_data,
+                                force_opaque,
+                                state->cubemap ? layer_idx : -1);
                 }
-                texrep_dump(binding->hash, dump_fmt, level0->width,
-                            level0->height, level0->decoded_data,
-                            force_opaque,
-                            state->cubemap ? layer_idx : -1);
+            }
+            if (!state->cubemap) {
+                TextureLevel *level0 = &layout->layers[0].levels[0];
+                if (level0->depth == 1) {
+                    texrep_auto_upscale(binding->hash, dump_fmt,
+                                        level0->width, level0->height,
+                                        level0->decoded_data, force_opaque);
+                }
             }
         }
     }
@@ -1348,6 +1360,18 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         if (is_indexed) {
             content_hash ^= fast_hash(palette_data, texture_palette_data_size);
         }
+    }
+
+    if (binding_found && !snode->replacement && !surface_to_texture &&
+        !(possibly_dirty && content_hash != snode->hash) &&
+        !r->in_command_buffer && snode->hash != 0 &&
+        texrep_take_ready(snode->hash)) {
+        // A background upscale finished for this texture. No command
+        // buffer is recording, so the image can be released without a
+        // sync; fall through to recreate with the fresh replacement.
+        content_hash = snode->hash;
+        texture_cache_release_node_resources(r, snode);
+        binding_found = false;
     }
 
     if (binding_found && snode->replacement &&

@@ -806,6 +806,9 @@ void MainMenuDisplayView::Draw()
             "Ultra (2560)\0",
             "Generated frame resolution; Auto adapts to display and speed");
     }
+    Toggle("AI texture upscaling (Neural Engine)",
+           &g_config.display.texture_pipeline.auto_upscale,
+           "Upscale game textures 4x in the background as they appear");
 #endif
 
     SectionTitle("Interface");

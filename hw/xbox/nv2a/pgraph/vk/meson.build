@@ -27,7 +27,8 @@ if host_os == 'darwin'
 	vk_macos_frameworks = dependency('appleframeworks',
 		modules: ['IOSurface', 'OpenGL', 'VideoToolbox', 'CoreVideo', 'CoreMedia', 'Accelerate'],
 		required: true)
-	specific_ss.add([vk_macos_frameworks, files('frame-interp-macos.m')])
+	specific_ss.add([vk_macos_frameworks, files('frame-interp-macos.m',
+		'texrep-ane-macos.m')])
 endif
 
 endif
