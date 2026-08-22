@@ -29,6 +29,8 @@ int nv2a_get_frame_time(void);
 #if defined(__APPLE__)
 #include <IOSurface/IOSurfaceRef.h>
 IOSurfaceRef nv2a_get_display_iosurface(void);
+void nv2a_set_display_interp_size(int width, int height);
+IOSurfaceRef nv2a_get_display_interp_iosurface(void);
 #endif
 void nv2a_set_surface_scale_factor(unsigned int scale);
 unsigned int nv2a_get_surface_scale_factor(void);
