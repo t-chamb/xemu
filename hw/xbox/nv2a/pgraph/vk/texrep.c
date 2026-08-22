@@ -34,10 +34,20 @@
 /* Keep the packed mip chain comfortably inside the 64MB staging buffer. */
 #define TEXREP_MAX_REPLACEMENT_DIM 2048
 
+/* Session-cache keys: content hash shifted left two, low bits selecting
+ * cubemap-ness and layer, so 2D/cube and user/auto entries never collide. */
+#define TEXREP_KEY_AUTO_BIT 0x1
+#define TEXREP_KEY_CUBE_BIT 0x2
+
 static struct {
     bool initialized;
     char *dump_dir;
-    char *replace_dir;
+    char *replace_dir;      /* user-provided packs */
+    char *auto_dir;         /* AI-generated layer; gated by auto_upscale */
+    /* Bumped whenever the replace/auto_upscale toggles change so live
+     * bindings re-evaluate their replacement against the new settings. */
+    uint32_t config_gen;
+    bool last_replace, last_auto;
     GHashTable *cache;      /* hash -> TexRepImage* (NULL = known absent) */
     GHashTable *dynamic;    /* vram_offset -> present */
     GHashTable *enqueued;   /* hash -> present; offered to the ANE worker */
@@ -78,7 +88,10 @@ void texrep_init(void)
     char *root = g_build_filename(base, "textures", NULL);
     g_texrep.dump_dir = g_build_filename(root, "dump", NULL);
     g_texrep.replace_dir = g_build_filename(root, "replace", NULL);
+    g_texrep.auto_dir = g_build_filename(root, "replace-auto", NULL);
     g_free(root);
+    g_texrep.last_replace = g_config.display.texture_pipeline.replace;
+    g_texrep.last_auto = g_config.display.texture_pipeline.auto_upscale;
 
     g_texrep.cache = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_texrep.dynamic = g_hash_table_new(g_int64_hash, g_int64_equal);
@@ -120,12 +133,28 @@ void texrep_finalize(void)
     g_hash_table_destroy(g_texrep.ready);
     g_free(g_texrep.dump_dir);
     g_free(g_texrep.replace_dir);
+    g_free(g_texrep.auto_dir);
     memset(&g_texrep, 0, sizeof(g_texrep));
 }
 
 bool texrep_replace_enabled(void)
 {
     return g_texrep.initialized && g_config.display.texture_pipeline.replace;
+}
+
+uint32_t texrep_config_generation(void)
+{
+    if (!g_texrep.initialized) {
+        return 0;
+    }
+    bool rep = g_config.display.texture_pipeline.replace;
+    bool aut = g_config.display.texture_pipeline.auto_upscale;
+    if (rep != g_texrep.last_replace || aut != g_texrep.last_auto) {
+        g_texrep.last_replace = rep;
+        g_texrep.last_auto = aut;
+        g_texrep.config_gen++;
+    }
+    return g_texrep.config_gen;
 }
 
 bool texrep_dump_enabled(void)
@@ -180,7 +209,8 @@ bool texrep_take_ready(uint64_t content_hash)
     g_mutex_unlock(&g_texrep.ready_lock);
 
     if (ready) {
-        uint64_t cache_key = content_hash << 1;
+        /* The worker writes into the auto layer. */
+        uint64_t cache_key = (content_hash << 2) | TEXREP_KEY_AUTO_BIT;
         gpointer orig_key = NULL, value = NULL;
         if (g_hash_table_lookup_extended(g_texrep.cache, &cache_key,
                                          &orig_key, &value) &&
@@ -211,12 +241,12 @@ void texrep_auto_upscale(uint64_t content_hash, TexRepDumpFormat fmt,
     g_hash_table_add(g_texrep.enqueued,
                      g_memdup2(&content_hash, sizeof(content_hash)));
 
-    char *path = hash_path(g_texrep.replace_dir, content_hash);
+    char *path = hash_path(g_texrep.auto_dir, content_hash);
     if (g_file_test(path, G_FILE_TEST_EXISTS)) {
         g_free(path);
         return;
     }
-    if (g_mkdir_with_parents(g_texrep.replace_dir, 0755) != 0) {
+    if (g_mkdir_with_parents(g_texrep.auto_dir, 0755) != 0) {
         g_free(path);
         return;
     }
@@ -297,17 +327,11 @@ static TexRepImage *build_image(uint8_t *rgba, int w, int h, TexRepOrder order)
     return img;
 }
 
-/* Cubemaps share the content-hash space with 2D textures; key their cache
- * entries with a face bit so the two can never collide. */
-#define TEXREP_CUBE_KEY_BIT 0x1
-
-const TexRepImage *texrep_lookup_cube(uint64_t content_hash, TexRepOrder order)
+static const TexRepImage *lookup_cube_layer(uint64_t content_hash,
+                                            TexRepOrder order,
+                                            const char *dir,
+                                            uint64_t key_val)
 {
-    if (!texrep_replace_enabled()) {
-        return NULL;
-    }
-
-    uint64_t key_val = (content_hash << 1) | TEXREP_CUBE_KEY_BIT;
     gpointer value;
     if (g_hash_table_lookup_extended(g_texrep.cache, &key_val, NULL, &value)) {
         return value;
@@ -317,7 +341,7 @@ const TexRepImage *texrep_lookup_cube(uint64_t content_hash, TexRepOrder order)
     TexRepImage *faces[6] = { NULL };
     bool ok = true;
     for (int f = 0; f < 6 && ok; f++) {
-        char *path = hash_face_path(g_texrep.replace_dir, content_hash, f);
+        char *path = hash_face_path(dir, content_hash, f);
         int w = 0, h = 0, channels = 0;
         /* Dimension check before decode; see texrep_lookup. */
         if (stbi_info(path, &w, &h, &channels)) {
@@ -371,13 +395,28 @@ const TexRepImage *texrep_lookup_cube(uint64_t content_hash, TexRepOrder order)
     return img;
 }
 
-const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
+const TexRepImage *texrep_lookup_cube(uint64_t content_hash, TexRepOrder order)
 {
-    if (!texrep_replace_enabled()) {
+    if (!g_texrep.initialized) {
         return NULL;
     }
+    const TexRepImage *img = NULL;
+    if (g_config.display.texture_pipeline.replace) {
+        img = lookup_cube_layer(content_hash, order, g_texrep.replace_dir,
+                                (content_hash << 2) | TEXREP_KEY_CUBE_BIT);
+    }
+    if (!img && g_config.display.texture_pipeline.auto_upscale) {
+        img = lookup_cube_layer(content_hash, order, g_texrep.auto_dir,
+                                (content_hash << 2) | TEXREP_KEY_CUBE_BIT |
+                                    TEXREP_KEY_AUTO_BIT);
+    }
+    return img;
+}
 
-    uint64_t key_val = content_hash << 1;
+static const TexRepImage *lookup_2d_layer(uint64_t content_hash,
+                                          TexRepOrder order, const char *dir,
+                                          uint64_t key_val)
+{
     gpointer value;
     if (g_hash_table_lookup_extended(g_texrep.cache, &key_val, NULL,
                                      &value)) {
@@ -385,7 +424,7 @@ const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
     }
 
     TexRepImage *img = NULL;
-    char *path = hash_path(g_texrep.replace_dir, content_hash);
+    char *path = hash_path(dir, content_hash);
     int w = 0, h = 0, channels = 0;
     /* Check declared dimensions before decoding so an oversized or
      * malicious PNG cannot force a huge allocation. */
@@ -399,7 +438,7 @@ const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
                 g_texrep.num_replaced++;
                 if (g_texrep.num_replaced == 1) {
                     fprintf(stderr, "[texrep] replacements active (%s)\n",
-                            g_texrep.replace_dir);
+                            dir);
                 }
             }
         } else {
@@ -412,6 +451,23 @@ const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
 
     uint64_t *key = g_memdup2(&key_val, sizeof(key_val));
     g_hash_table_insert(g_texrep.cache, key, img);
+    return img;
+}
+
+const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
+{
+    if (!g_texrep.initialized) {
+        return NULL;
+    }
+    const TexRepImage *img = NULL;
+    if (g_config.display.texture_pipeline.replace) {
+        img = lookup_2d_layer(content_hash, order, g_texrep.replace_dir,
+                              content_hash << 2);
+    }
+    if (!img && g_config.display.texture_pipeline.auto_upscale) {
+        img = lookup_2d_layer(content_hash, order, g_texrep.auto_dir,
+                              (content_hash << 2) | TEXREP_KEY_AUTO_BIT);
+    }
     return img;
 }
 

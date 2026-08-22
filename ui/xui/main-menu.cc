@@ -808,7 +808,7 @@ void MainMenuDisplayView::Draw()
     }
     Toggle("AI texture upscaling (Neural Engine)",
            &g_config.display.texture_pipeline.auto_upscale,
-           "Upscale game textures 4x in the background as they appear");
+           "Upscale textures 4x in the background; takes effect immediately");
 #endif
 
     SectionTitle("Interface");
