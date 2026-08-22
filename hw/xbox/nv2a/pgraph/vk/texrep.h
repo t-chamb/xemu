@@ -61,10 +61,12 @@ typedef enum TexRepDumpFormat {
 
 typedef struct TexRepImage {
     int width, height;
-    int levels;                /* full mip chain length */
-    uint8_t *data;             /* packed chain, native channel order */
+    int levels;                /* full mip chain length (per face) */
+    int faces;                 /* 1 for 2D, 6 for cubemaps */
+    uint8_t *data;             /* packed chain(s), native channel order */
     size_t data_size;
-    size_t level_offset[TEXREP_MAX_LEVELS];
+    size_t face_stride;        /* bytes per face chain (== data_size / faces) */
+    size_t level_offset[TEXREP_MAX_LEVELS];   /* within a face chain */
     int level_width[TEXREP_MAX_LEVELS];
     int level_height[TEXREP_MAX_LEVELS];
 } TexRepImage;
@@ -79,6 +81,11 @@ bool texrep_dump_enabled(void);
  * or NULL. The returned pointer stays valid until texrep_finalize(). */
 const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order);
 
+/* Cubemap variant: requires all six <hash>_face0..5.png files with
+ * identical square dimensions. */
+const TexRepImage *texrep_lookup_cube(uint64_t content_hash,
+                                      TexRepOrder order);
+
 /* Mark a guest texture address as dynamic; its contents were observed to
  * change in place, so it must never be replaced this session. */
 void texrep_mark_dynamic(uint64_t vram_offset);
@@ -90,8 +97,10 @@ bool texrep_is_dynamic(uint64_t vram_offset);
  * style): their stored alpha bytes are junk (frequently zero), and
  * propagating them into the PNG makes every alpha-aware scaler
  * premultiply the color channels to black. */
+/* face < 0 writes <hash>.png (2D); face 0..5 writes <hash>_faceN.png. */
 void texrep_dump(uint64_t content_hash, TexRepDumpFormat fmt, int width,
-                 int height, const void *level0_data, bool force_opaque);
+                 int height, const void *level0_data, bool force_opaque,
+                 int face);
 
 #ifdef __cplusplus
 }
