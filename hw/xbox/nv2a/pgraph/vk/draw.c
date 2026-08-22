@@ -2133,10 +2133,13 @@ static void copy_remapped_attributes_to_inline_buffer(PGRAPHState *pg,
 }
 
 /* Without geometry shaders, quads are drawn as triangle lists with indices
- * expanded on the CPU: quad (0,1,2,3) becomes triangles (3,0,1) and (3,1,2)
- * — same coverage and winding as the GS expansion, and both triangles lead
- * with v3, which is the quad's provoking vertex on NV2A, so Vulkan's
- * first-vertex flat-shading convention picks the correct color.
+ * expanded on the CPU. Smooth shading splits along the 0-2 diagonal —
+ * (0,1,2)/(0,2,3) — matching the NV2A/GS split so attribute interpolation
+ * is identical. Flat shading needs every triangle to contain AND lead
+ * with v3 (the quad's provoking vertex on NV2A, mapped to Vulkan's
+ * first-vertex convention), which forces the 1-3 diagonal:
+ * (3,0,1)/(3,1,2). Flat color is constant per face, so the diagonal only
+ * matters for the (rare) non-planar quad.
  */
 static bool needs_quad_index_expansion(PGRAPHState *pg)
 {
@@ -2148,9 +2151,13 @@ static bool needs_quad_index_expansion(PGRAPHState *pg)
            !r->enabled_physical_device_features.geometryShader;
 }
 
-static uint32_t expand_quads_to_triangles(const uint32_t *in, uint32_t start,
-                                          uint32_t count, uint32_t *out)
+static uint32_t expand_quads_to_triangles(PGRAPHState *pg, const uint32_t *in,
+                                          uint32_t start, uint32_t count,
+                                          uint32_t *out)
 {
+    bool smooth = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3),
+                           NV_PGRAPH_CONTROL_3_SHADEMODE) ==
+                  NV_PGRAPH_CONTROL_3_SHADEMODE_SMOOTH;
     uint32_t num_quads = count / 4;
     uint32_t *p = out;
     for (uint32_t q = 0; q < num_quads; q++) {
@@ -2159,8 +2166,13 @@ static uint32_t expand_quads_to_triangles(const uint32_t *in, uint32_t start,
         uint32_t i1 = in ? in[base + 1] : start + base + 1;
         uint32_t i2 = in ? in[base + 2] : start + base + 2;
         uint32_t i3 = in ? in[base + 3] : start + base + 3;
-        *p++ = i3; *p++ = i0; *p++ = i1;
-        *p++ = i3; *p++ = i1; *p++ = i2;
+        if (smooth) {
+            *p++ = i0; *p++ = i1; *p++ = i2;
+            *p++ = i0; *p++ = i2; *p++ = i3;
+        } else {
+            *p++ = i3; *p++ = i0; *p++ = i1;
+            *p++ = i3; *p++ = i1; *p++ = i2;
+        }
     }
     return p - out;
 }
@@ -2209,7 +2221,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
                                      sizeof(uint32_t));
             for (int i = 0; i < pg->draw_arrays_length; i++) {
                 num_quad_indices += expand_quads_to_triangles(
-                    NULL, pg->draw_arrays_start[i], pg->draw_arrays_count[i],
+                    pg, NULL, pg->draw_arrays_start[i], pg->draw_arrays_count[i],
                     quad_indices + num_quad_indices);
             }
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
@@ -2263,7 +2275,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
             quad_indices = g_malloc0(MAX(index_count / 4, 1u) * 6 *
                                      sizeof(uint32_t));
             index_count = expand_quads_to_triangles(
-                pg->inline_elements, 0, index_count, quad_indices);
+                pg, pg->inline_elements, 0, index_count, quad_indices);
             index_data = quad_indices;
         }
         size_t index_data_size = index_count * sizeof(uint32_t);
@@ -2330,8 +2342,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         if (quads_expanded) {
             quad_indices = g_malloc0(MAX(pg->inline_buffer_length / 4, 1u) *
                                      6 * sizeof(uint32_t));
-            num_quad_indices = expand_quads_to_triangles(
-                NULL, 0, pg->inline_buffer_length, quad_indices);
+            num_quad_indices = expand_quads_to_triangles(pg, NULL, 0, pg->inline_buffer_length, quad_indices);
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
                                 num_quad_indices * sizeof(uint32_t));
         }
@@ -2401,7 +2412,7 @@ void pgraph_vk_flush_draw(NV2AState *d)
         if (quads_expanded) {
             quad_indices = g_malloc0(MAX(index_count / 4, 1u) * 6 *
                                      sizeof(uint32_t));
-            num_quad_indices = expand_quads_to_triangles(NULL, 0, index_count,
+            num_quad_indices = expand_quads_to_triangles(pg, NULL, 0, index_count,
                                                          quad_indices);
             ensure_buffer_space(pg, BUFFER_INDEX_STAGING,
                                 num_quad_indices * sizeof(uint32_t));
