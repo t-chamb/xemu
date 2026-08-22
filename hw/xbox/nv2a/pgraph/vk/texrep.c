@@ -47,6 +47,13 @@ static char *hash_path(const char *dir, uint64_t hash)
     return g_build_filename(dir, name, NULL);
 }
 
+static char *hash_face_path(const char *dir, uint64_t hash, int face)
+{
+    char name[40];
+    snprintf(name, sizeof(name), "%016" PRIx64 "_face%d.png", hash, face);
+    return g_build_filename(dir, name, NULL);
+}
+
 void texrep_init(void)
 {
     if (g_texrep.initialized) {
@@ -155,6 +162,7 @@ static TexRepImage *build_image(uint8_t *rgba, int w, int h, TexRepOrder order)
     TexRepImage *img = g_malloc0(sizeof(*img));
     img->width = w;
     img->height = h;
+    img->faces = 1;
 
     int lw = w, lh = h;
     size_t total = 0;
@@ -173,6 +181,7 @@ static TexRepImage *build_image(uint8_t *rgba, int w, int h, TexRepOrder order)
 
     img->data = g_malloc(total);
     img->data_size = total;
+    img->face_stride = total;
     memcpy(img->data, rgba, (size_t)w * h * 4);
     for (int i = 1; i < img->levels; i++) {
         downsample_level(img->data + img->level_offset[i - 1],
@@ -183,14 +192,89 @@ static TexRepImage *build_image(uint8_t *rgba, int w, int h, TexRepOrder order)
     return img;
 }
 
+/* Cubemaps share the content-hash space with 2D textures; key their cache
+ * entries with a face bit so the two can never collide. */
+#define TEXREP_CUBE_KEY_BIT 0x1
+
+const TexRepImage *texrep_lookup_cube(uint64_t content_hash, TexRepOrder order)
+{
+    if (!texrep_replace_enabled()) {
+        return NULL;
+    }
+
+    uint64_t key_val = (content_hash << 1) | TEXREP_CUBE_KEY_BIT;
+    gpointer value;
+    if (g_hash_table_lookup_extended(g_texrep.cache, &key_val, NULL, &value)) {
+        return value;
+    }
+
+    TexRepImage *img = NULL;
+    TexRepImage *faces[6] = { NULL };
+    bool ok = true;
+    for (int f = 0; f < 6 && ok; f++) {
+        char *path = hash_face_path(g_texrep.replace_dir, content_hash, f);
+        int w = 0, h = 0, channels = 0;
+        /* Dimension check before decode; see texrep_lookup. */
+        if (stbi_info(path, &w, &h, &channels)) {
+            uint8_t *rgba = NULL;
+            /* Six full chains must fit the staging buffer together. */
+            if (w == h && w > 0 && w <= 1024 &&
+                (f == 0 || (w == faces[0]->width && h == faces[0]->height))) {
+                rgba = stbi_load(path, &w, &h, &channels, 4);
+            }
+            if (rgba) {
+                faces[f] = build_image(rgba, w, h, order);
+                stbi_image_free(rgba);
+            } else {
+                fprintf(stderr,
+                        "[texrep] %s: cube face must be square, <=1024 and "
+                        "uniform, ignored\n", path);
+                ok = false;
+            }
+        } else {
+            /* No face 0: plain miss. A later face missing is an error. */
+            if (f > 0) {
+                fprintf(stderr,
+                        "[texrep] cube %016" PRIx64 ": missing face %d, "
+                        "ignored\n", content_hash, f);
+            }
+            ok = false;
+        }
+        g_free(path);
+    }
+
+    if (ok && faces[5]) {
+        img = g_malloc0(sizeof(*img));
+        *img = *faces[0];
+        img->faces = 6;
+        img->data_size = img->face_stride * 6;
+        img->data = g_malloc(img->data_size);
+        for (int f = 0; f < 6; f++) {
+            memcpy(img->data + f * img->face_stride, faces[f]->data,
+                   img->face_stride);
+        }
+    }
+    for (int f = 0; f < 6; f++) {
+        if (faces[f]) {
+            g_free(faces[f]->data);
+            g_free(faces[f]);
+        }
+    }
+
+    uint64_t *key = g_memdup2(&key_val, sizeof(key_val));
+    g_hash_table_insert(g_texrep.cache, key, img);
+    return img;
+}
+
 const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
 {
     if (!texrep_replace_enabled()) {
         return NULL;
     }
 
+    uint64_t key_val = content_hash << 1;
     gpointer value;
-    if (g_hash_table_lookup_extended(g_texrep.cache, &content_hash, NULL,
+    if (g_hash_table_lookup_extended(g_texrep.cache, &key_val, NULL,
                                      &value)) {
         return value; /* may be the cached-negative NULL */
     }
@@ -198,26 +282,30 @@ const TexRepImage *texrep_lookup(uint64_t content_hash, TexRepOrder order)
     TexRepImage *img = NULL;
     char *path = hash_path(g_texrep.replace_dir, content_hash);
     int w = 0, h = 0, channels = 0;
-    uint8_t *rgba = stbi_load(path, &w, &h, &channels, 4);
-    if (rgba) {
+    /* Check declared dimensions before decoding so an oversized or
+     * malicious PNG cannot force a huge allocation. */
+    if (stbi_info(path, &w, &h, &channels)) {
         if (w > 0 && h > 0 && w <= TEXREP_MAX_REPLACEMENT_DIM &&
             h <= TEXREP_MAX_REPLACEMENT_DIM) {
-            img = build_image(rgba, w, h, order);
-            g_texrep.num_replaced++;
-            if (g_texrep.num_replaced == 1) {
-                fprintf(stderr, "[texrep] replacements active (%s)\n",
-                        g_texrep.replace_dir);
+            uint8_t *rgba = stbi_load(path, &w, &h, &channels, 4);
+            if (rgba) {
+                img = build_image(rgba, w, h, order);
+                stbi_image_free(rgba);
+                g_texrep.num_replaced++;
+                if (g_texrep.num_replaced == 1) {
+                    fprintf(stderr, "[texrep] replacements active (%s)\n",
+                            g_texrep.replace_dir);
+                }
             }
         } else {
             fprintf(stderr,
                     "[texrep] %s: %dx%d exceeds max dimension %d, ignored\n",
                     path, w, h, TEXREP_MAX_REPLACEMENT_DIM);
         }
-        stbi_image_free(rgba);
     }
     g_free(path);
 
-    uint64_t *key = g_memdup2(&content_hash, sizeof(content_hash));
+    uint64_t *key = g_memdup2(&key_val, sizeof(key_val));
     g_hash_table_insert(g_texrep.cache, key, img);
     return img;
 }
@@ -270,13 +358,16 @@ static void convert_to_rgba(TexRepDumpFormat fmt, const void *src, int count,
 }
 
 void texrep_dump(uint64_t content_hash, TexRepDumpFormat fmt, int width,
-                 int height, const void *level0_data, bool force_opaque)
+                 int height, const void *level0_data, bool force_opaque,
+                 int face)
 {
     if (!texrep_dump_enabled() || width <= 0 || height <= 0) {
         return;
     }
 
-    char *path = hash_path(g_texrep.dump_dir, content_hash);
+    char *path = face < 0 ? hash_path(g_texrep.dump_dir, content_hash) :
+                            hash_face_path(g_texrep.dump_dir, content_hash,
+                                           face);
     if (g_file_test(path, G_FILE_TEST_EXISTS)) {
         g_free(path);
         return;
