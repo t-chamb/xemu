@@ -26,7 +26,7 @@
 #include <glslang/Include/glslang_c_interface.h>
 #include <stdio.h>
 
-#define SPIRV_CACHE_VERSION 2
+#define SPIRV_CACHE_VERSION 4
 #define SPIRV_CACHE_MAGIC   0x53505643 /* 'SPVC' */
 #define SPIRV_MAGIC_WORD    0x07230203
 
@@ -181,15 +181,29 @@ static void save_spirv_cache(void)
     g_free(path);
 }
 
-static uint64_t spirv_cache_key(PGRAPHVkState *r, const char *glsl)
+static uint64_t spirv_cache_key(PGRAPHVkState *r, VkShaderStageFlagBits stage,
+                                const char *glsl)
 {
-    uint64_t hash = fast_hash((const uint8_t *)glsl, strlen(glsl));
-    return hash ^ ((uint64_t)r->vk_api_version << 32);
+    bool debug_shaders = g_config.display.vulkan.debug_shaders;
+    GByteArray *key =
+        g_byte_array_sized_new(sizeof(r->vk_api_version) + sizeof(stage) +
+                               sizeof(debug_shaders) + strlen(glsl));
+    g_byte_array_append(key, (const uint8_t *)&r->vk_api_version,
+                        sizeof(r->vk_api_version));
+    g_byte_array_append(key, (const uint8_t *)&stage, sizeof(stage));
+    g_byte_array_append(key, (const uint8_t *)&debug_shaders,
+                        sizeof(debug_shaders));
+    g_byte_array_append(key, (const uint8_t *)glsl, strlen(glsl));
+    uint64_t hash = fast_hash(key->data, key->len);
+    g_byte_array_unref(key);
+    return hash;
 }
 
-static GByteArray *spirv_cache_lookup(PGRAPHVkState *r, const char *glsl)
+static GByteArray *spirv_cache_lookup(PGRAPHVkState *r,
+                                      VkShaderStageFlagBits stage,
+                                      const char *glsl)
 {
-    uint64_t hash = spirv_cache_key(r, glsl);
+    uint64_t hash = spirv_cache_key(r, stage, glsl);
     g_mutex_lock(&spirv_cache_lock);
     SpirvCacheEntry *entry = g_hash_table_lookup(spirv_cache, &hash);
     GByteArray *arr = NULL;
@@ -201,10 +215,11 @@ static GByteArray *spirv_cache_lookup(PGRAPHVkState *r, const char *glsl)
     return arr;
 }
 
-static void spirv_cache_insert(PGRAPHVkState *r, const char *glsl,
+static void spirv_cache_insert(PGRAPHVkState *r,
+                               VkShaderStageFlagBits stage, const char *glsl,
                                GByteArray *spirv)
 {
-    uint64_t hash = spirv_cache_key(r, glsl);
+    uint64_t hash = spirv_cache_key(r, stage, glsl);
     SpirvCacheEntry *entry = g_malloc(sizeof(SpirvCacheEntry));
     entry->hash = hash;
     entry->spirv_len = spirv->len;
@@ -600,11 +615,11 @@ ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
     ShaderModuleInfo *info = g_malloc0(sizeof(*info));
     info->refcnt = 0;
     info->glsl = strdup(glsl);
-    info->spirv = spirv_cache_lookup(r, glsl);
+    info->spirv = spirv_cache_lookup(r, stage, glsl);
     if (!info->spirv) {
         info->spirv = pgraph_vk_compile_glsl_to_spv(
             r, vk_shader_stage_to_glslang_stage(stage), glsl);
-        spirv_cache_insert(r, glsl, info->spirv);
+        spirv_cache_insert(r, stage, glsl, info->spirv);
     }
     info->module = pgraph_vk_create_shader_module_from_spv(r, info->spirv);
     init_layout_from_spv(info);
